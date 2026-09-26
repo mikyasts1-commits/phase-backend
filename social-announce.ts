@@ -13,9 +13,25 @@
  *  5. Return per-provider results
  */
 
-import sharp from "sharp";
 import { randomBytes } from "node:crypto";
 import { decryptToken } from "./social-auth.js";
+
+// sharp is loaded lazily — if the native module fails on the deploy target,
+// card generation falls back to serving the raw SVG instead of crashing boot.
+let sharpImpl: any = null;
+let sharpFailed = false;
+async function getSharp(): Promise<any> {
+  if (sharpImpl) return sharpImpl;
+  if (sharpFailed) return null;
+  try {
+    const mod = await import("sharp");
+    sharpImpl = mod.default || mod;
+    return sharpImpl;
+  } catch {
+    sharpFailed = true;
+    return null;
+  }
+}
 
 interface RouteCtx {
   route(
@@ -33,15 +49,16 @@ interface RouteCtx {
 }
 
 // In-memory card store (use S3/R2 in production)
-const cardStore = new Map<string, Buffer>();
+const cardStore = new Map<string, { bytes: Buffer; contentType: string }>();
 
 // In-memory announcement log
 const announcementLog: any[] = [];
 
 /**
  * Generate a branded coin launch card (1080x1080 PNG).
+ * Falls back to SVG bytes if sharp is unavailable on the host.
  */
-export async function generateLaunchCard(coinName: string, ticker: string, isMeme: boolean): Promise<Buffer> {
+export async function generateLaunchCard(coinName: string, ticker: string, isMeme: boolean): Promise<{ bytes: Buffer; contentType: string }> {
   const bg = isMeme ? "#1a0b2e" : "#0c4a6e";
   const accent = isMeme ? "#a855f7" : "#0ea5e9";
   const badge = isMeme ? "MEME COIN" : "ISSUER COVENANT SIGNED";
@@ -86,7 +103,13 @@ export async function generateLaunchCard(coinName: string, ticker: string, isMem
           font-size="28" fill="#64748b">Everyone gets their own blockchain</text>
   </svg>`;
 
-  return sharp(Buffer.from(svg)).png().toBuffer();
+  const sharp = await getSharp();
+  if (sharp) {
+    const png = await sharp(Buffer.from(svg)).png().toBuffer();
+    return { bytes: png, contentType: "image/png" };
+  }
+  // Fallback: raw SVG (social APIs prefer PNG, but the server stays up)
+  return { bytes: Buffer.from(svg), contentType: "image/svg+xml" };
 }
 
 function escapeXml(s: string): string {
@@ -176,11 +199,13 @@ export function mountAnnounceRoutes(deps: RouteCtx, store?: AnnounceStore) {
   const db: AnnounceStore = store || new MemoryAnnounceStore();
 
   // Serve generated launch cards (public URL for social APIs to pull from)
-  route("GET", "/api/v1/social/cards/:cardId.png", async (ctx) => {
-    const buf = cardStore.get(ctx.params.cardId);
-    if (!buf) throw new HttpError(404, "card_not_found", "Launch card not found");
-    return new Response(buf as any, {
-      headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" },
+  route("GET", "/api/v1/social/cards/:cardId", async (ctx) => {
+    // Strip any extension (.png / .svg) from the card id
+    const rawId = ctx.params.cardId.replace(/\.(png|svg)$/, "");
+    const card = cardStore.get(rawId);
+    if (!card) throw new HttpError(404, "card_not_found", "Launch card not found");
+    return new Response(card.bytes as any, {
+      headers: { "Content-Type": card.contentType, "Cache-Control": "public, max-age=86400" },
     });
   });
 
@@ -189,8 +214,8 @@ export function mountAnnounceRoutes(deps: RouteCtx, store?: AnnounceStore) {
     const body = (ctx.body || {}) as { coinName?: string; ticker?: string; meme?: boolean };
     if (!body.coinName || !body.ticker) throw new HttpError(400, "missing_fields", "coinName and ticker required");
     const cardId = `card_${randomBytes(8).toString("hex")}`;
-    const png = await generateLaunchCard(body.coinName, body.ticker, !!body.meme);
-    cardStore.set(cardId, png);
+    const card = await generateLaunchCard(body.coinName, body.ticker, !!body.meme);
+    cardStore.set(cardId, card);
     const baseUrl = process.env.PUBLIC_BASE_URL || "https://phase-backend.onrender.com";
     return sendJson({ cardId, cardUrl: `${baseUrl}/api/v1/social/cards/${cardId}.png` });
   });
@@ -210,8 +235,10 @@ export function mountAnnounceRoutes(deps: RouteCtx, store?: AnnounceStore) {
       cardId = `card_${randomBytes(8).toString("hex")}`;
       cardStore.set(cardId, await generateLaunchCard(body.coinName, body.ticker, !!body.meme));
     }
+    const servedCard = cardStore.get(cardId)!;
+    const cardExt = servedCard.contentType === "image/png" ? "png" : "svg";
     const baseUrl = process.env.PUBLIC_BASE_URL || "https://phase-backend.onrender.com";
-    const cardUrl = `${baseUrl}/api/v1/social/cards/${cardId}.png`;
+    const cardUrl = `${baseUrl}/api/v1/social/cards/${cardId}.${cardExt}`;
 
     const caption = body.meme
       ? `I just launched $${body.ticker} (${body.coinName}) on Phase — no promises, just vibes. Everyone gets their own blockchain.`
