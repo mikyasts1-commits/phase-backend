@@ -56,6 +56,7 @@ import { randomUUID } from "node:crypto";
 import { URL } from "node:url";
 import { getUsdPerBtc, getQuote, getFeedStatus } from "./market-data.js";
 import { mountFundingRoutes } from "./crypto-funding.js";
+import { mountBtcRoutes } from "./btc-funding.js";
 import { mountIssuanceRoutes } from "./issuance.js";
 import { mountSocialRoutes } from "./social-auth.js";
 import { mountAnnounceRoutes } from "./social-announce.js";
@@ -1059,6 +1060,7 @@ try {
   console.warn(`[funding] Postgres migrate skipped: ${err instanceof Error ? err.message : String(err)}`);
 }
 mountFundingRoutes({ route, sendJson, HttpError });
+mountBtcRoutes({ route, sendJson, HttpError });
 
 // --- 8d-ii. Social connections + launch announcements (see social-auth.ts, social-announce.ts) ---
 // These modules were written against a fetch-style interface (handler returns
