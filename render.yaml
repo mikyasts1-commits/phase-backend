@@ -1,0 +1,51 @@
+# render.yaml — Phase backend deploy prep (Render free tier).
+# DO NOT apply until accounts exist. Nothing here deploys by itself.
+services:
+  - type: web
+    name: phase-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    # tsx runs the TypeScript entry directly; no build step needed.
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      # --- Postgres (Render free Postgres, or Supabase — pick one) ---
+      - key: DATABASE_URL
+        sync: false # paste from the Render Postgres dashboard (internal URL)
+
+      # --- Circle (testnet ONLY — no mainnet keys here) ---
+      - key: CIRCLE_API_KEY
+        sync: false # Circle testnet API key (Console -> Developers -> API Keys)
+      - key: CIRCLE_ENTITY_SECRET
+        sync: false # hex entity secret for developer-controlled wallets
+      - key: CIRCLE_WALLET_SET_ID
+        sync: false # existing wallet set id (already pinned)
+      - key: CIRCLE_WEBHOOK_SECRET
+        sync: false # HMAC secret for webhook signature verification
+      # Optional: comma-separated Circle chain ids. Defaults to testnet set:
+      # BASE-SEPOLIA, MATIC-AMOY, SOL-DEVNET, ETH-SEPOLIA (+ USDT on EVM chains).
+      - key: CIRCLE_CHAINS
+        sync: false
+
+      # --- Solana devnet mint authority ---
+      # The mint-authority keypair lives in .secrets/solana-mint-authority.json
+      # on the CURRENT machine and is NOT committed. For Render, either:
+      #   (a) upload it once via the Render shell into the persistent disk, or
+      #   (b) paste the JSON array into SOLANA_MINT_AUTHORITY_JSON (secret).
+      - key: SOLANA_MINT_AUTHORITY_JSON
+        sync: false
+      # Override only to point at the keypair file; devnet RPC is hardcoded
+      # in solana-mint.ts and cannot be changed to mainnet.
+      - key: SOLANA_MINT_AUTHORITY_PATH
+        sync: false
+
+      # --- Supabase (auth; thin issuance_users profile table mirrors it) ---
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+
+      # --- Market data (server-side Finnhub; app never sees the key) ---
+      - key: FINNHUB_API_KEY
+        sync: false

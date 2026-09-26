@@ -1,0 +1,24 @@
+{
+  "name": "phase-protocol-mock-backend",
+  "version": "0.1.0",
+  "description": "Zero-dependency single-file mock backend for the Phase Protocol (in-memory simulated ledger). Built on Node's built-in http module only.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx phase-backend.ts",
+    "start": "tsx phase-backend.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.16.5",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "pg": "^8.23.0"
+  }
+}

@@ -1,0 +1,8 @@
+.env
+.env.*
+.secrets/
+node_modules/
+faucet-test-wallet.json
+*.log
+.DS_Store
+dist/
