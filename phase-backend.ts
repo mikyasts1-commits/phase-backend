@@ -1060,12 +1060,52 @@ try {
 }
 mountFundingRoutes({ route, sendJson, HttpError });
 
+// --- 8d-ii. Social connections + launch announcements (see social-auth.ts, social-announce.ts) ---
+// These modules were written against a fetch-style interface (handler returns
+// a Response, sendJson(data, status) builds one). Adapt to this server's
+// Node-style interface (handler writes via ctx.res, sendJson(res, status, body)).
+{
+  const adaptSendJson = (data: unknown, status = 200): Response => {
+    // Build a real Response object; the route adapter below will forward it.
+    return new Response(JSON.stringify(data), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  const adaptRoute = (
+    method: string,
+    path: string,
+    handler: (ctx: { req: Request; url: URL; params: Record<string, string>; body: unknown }) => Promise<unknown>
+  ): void => {
+    route(method, path, async (ctx: RouteContext) => {
+      const url = new URL(ctx.req.url || "/", "http://localhost");
+      const result: any = await handler({ req: ctx.req as any, url, params: ctx.params, body: ctx.body });
+      if (result instanceof Response) {
+        const text = await result.text();
+        ctx.res.writeHead(result.status, {
+          "Content-Type": result.headers.get("content-type") || "application/json",
+        });
+        ctx.res.end(text);
+      } else if (result !== undefined) {
+        sendJson(ctx.res, 200, result);
+      }
+    });
+  };
+  // The server's error middleware checks `err instanceof HttpError` and reads
+  // `err.statusCode`; extending the real HttpError keeps both working.
+  const HttpErrorAdapter = class extends HttpError {
+    constructor(status: number, code: string, message: string) {
+      super(status, code, message);
+    }
+  };
+  mountSocialRoutes({ route: adaptRoute, sendJson: adaptSendJson, HttpError: HttpErrorAdapter as any });
+  mountAnnounceRoutes({ route: adaptRoute, sendJson: adaptSendJson, HttpError: HttpErrorAdapter as any });
+}
+
 // --- 8e-v. Coin issuance (Solana devnet; see issuance.ts) ---
 // Same best-effort pattern: issuance falls back to an in-memory store when
 // Postgres is unavailable, so the server still boots.
 mountIssuanceRoutes({ route, sendJson, HttpError });
-mountSocialRoutes({ route, sendJson, HttpError });
-mountAnnounceRoutes({ route, sendJson, HttpError });
 
 // --- 8f. Ledger introspection (debug/demo aid — see the simulated chain) ---
 route("GET", "/api/v1/ledger/blocks", async (ctx) => {
