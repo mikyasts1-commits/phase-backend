@@ -1104,7 +1104,14 @@ async function getWebhookPublicKey(keyId: string): Promise<string> {
   const template =
     (process.env.CIRCLE_WEBHOOK_PUBKEY_URL ?? "https://api.circle.com/v2/cpn/notifications/publicKey/{keyId}").trim();
   const url = template.replace("{keyId}", encodeURIComponent(keyId));
-  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  // Circle's notification public-key endpoint requires API authentication.
+  // Without the Bearer token it returns 401/403, which used to surface as a
+  // webhook 401 ("bad signature") and blocked console activation tests.
+  const bearer = apiKey();
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(10_000),
+    ...(bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : {}),
+  });
   if (!res.ok) throw new Error(`webhook pubkey fetch failed: ${res.status}`);
   const data = (await res.json()) as { publicKey?: unknown; data?: { publicKey?: unknown } };
   const b64 = typeof data.publicKey === "string" ? data.publicKey : (data.data?.publicKey as string | undefined);
