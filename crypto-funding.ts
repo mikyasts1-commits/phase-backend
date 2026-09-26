@@ -1150,6 +1150,9 @@ export interface WebhookResult {
   action: string;
 }
 
+/** Last webhook attempt metadata (diagnostic only; never stores signatures or secrets). */
+let lastWebhookAttempt: Record<string, unknown> | null = null;
+
 /**
  * Verify + apply a Circle webhook. Unverifiable payloads are REJECTED (the
  * route returns 401) — the ledger is never touched by them. Returns a
@@ -1160,31 +1163,69 @@ export async function handleCircleWebhook(
   rawBody: Buffer | undefined,
   parsed: CircleWebhookPayload
 ): Promise<WebhookResult> {
+  const attempt: Record<string, unknown> = {
+    at: new Date().toISOString(),
+    bodyBytes: rawBody?.length ?? 0,
+    hasSignatureHeader: headerValue(headers, "x-circle-signature") != null,
+    hasKeyIdHeader: headerValue(headers, "x-circle-key-id") != null,
+    notificationType: (parsed as { notificationType?: unknown }).notificationType ?? null,
+  };
+  lastWebhookAttempt = attempt;
   if (!rawBody || rawBody.length === 0) {
+    attempt.outcome = "400_no_raw_body";
     throw new FundingHttpError(400, "webhook_no_raw_body", "Raw request body is required for signature verification.");
   }
   const signature = headerValue(headers, "x-circle-signature");
   const keyId = headerValue(headers, "x-circle-key-id");
   if (!signature) {
+    attempt.outcome = "401_missing_signature";
     throw new FundingHttpError(401, "webhook_missing_signature", "Missing X-Circle-Signature header.");
   }
 
   let verified = false;
   let scheme: WebhookResult["scheme"] = "none";
+  let verifyDetail = "";
   if (keyId) {
-    verified = await verifyEcdsaSignature(rawBody, signature, keyId);
+    attempt.keyIdPrefix = keyId.slice(0, 8);
+    try {
+      const pubKeyB64 = await getWebhookPublicKey(keyId);
+      attempt.pubkeyFetched = true;
+      attempt.pubkeyLength = pubKeyB64.length;
+      const key = decodeCirclePublicKey(pubKeyB64);
+      attempt.keyDecoded = true;
+      const sig = Buffer.from(signature, "base64");
+      attempt.signatureBytes = sig.length;
+      for (const dsaEncoding of ["der", "ieee-p1363"] as const) {
+        try {
+          const v = createVerify("sha256");
+          v.update(rawBody);
+          if (v.verify({ key, dsaEncoding }, sig)) { verified = true; break; }
+        } catch (e) {
+          verifyDetail = `${dsaEncoding}:${e instanceof Error ? e.message : "err"}`;
+        }
+      }
+      if (!verified && !verifyDetail) verifyDetail = "signature_mismatch_both_encodings";
+    } catch (e) {
+      attempt.pubkeyFetched = false;
+      verifyDetail = `pubkey_stage:${e instanceof Error ? e.message : "err"}`;
+    }
     scheme = "ecdsa";
   } else {
     verified = verifyHmacSignature(rawBody, signature);
+    if (!verified) verifyDetail = "hmac_mismatch";
     scheme = "hmac";
   }
+  attempt.scheme = scheme;
+  attempt.verifyDetail = verifyDetail;
   if (!verified) {
+    attempt.outcome = "401_bad_signature";
     throw new FundingHttpError(
       401,
       "webhook_bad_signature",
       `Circle webhook signature could not be verified (scheme attempted: ${scheme}). Ledger untouched.`
     );
   }
+  attempt.outcome = "verified";
 
   const notificationId = parsed.notificationId ?? null;
   const notificationType = parsed.notificationType ?? null;
@@ -1522,6 +1563,11 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   // Circle validates webhook endpoints with a HEAD request on subscribe.
   route("HEAD", "/api/v1/funding/webhooks", async (ctx) => {
     sendJson(ctx.res, 200, { ...networkEnvelope(), ok: true });
+  });
+
+  // Temporary diagnostic: metadata about the last webhook attempt (no secrets).
+  route("GET", "/api/v1/funding/webhooks/last-attempt", async (ctx) => {
+    sendJson(ctx.res, 200, { ...networkEnvelope(), attempt: lastWebhookAttempt });
   });
 
   // --- GET /api/v1/funding/ledger?userId=&refresh=true ---
