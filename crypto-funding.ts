@@ -1102,7 +1102,7 @@ async function getWebhookPublicKey(keyId: string): Promise<string> {
   const cached = webhookPubkeyCache.get(keyId);
   if (cached) return cached;
   const template =
-    (process.env.CIRCLE_WEBHOOK_PUBKEY_URL ?? "https://api.circle.com/v2/cpn/notifications/publicKey/{keyId}").trim();
+    (process.env.CIRCLE_WEBHOOK_PUBKEY_URL ?? "https://api.circle.com/v2/notifications/publicKey/{keyId}").trim();
   const url = template.replace("{keyId}", encodeURIComponent(keyId));
   // Circle's notification public-key endpoint requires API authentication.
   // Without the Bearer token it returns 401/403, which used to surface as a
