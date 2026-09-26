@@ -57,6 +57,8 @@ import { URL } from "node:url";
 import { getUsdPerBtc, getQuote, getFeedStatus } from "./market-data.js";
 import { mountFundingRoutes } from "./crypto-funding.js";
 import { mountIssuanceRoutes } from "./issuance.js";
+import { mountSocialRoutes } from "./social-auth.js";
+import { mountAnnounceRoutes } from "./social-announce.js";
 import { migrate as migrateFundingDb } from "./db.js";
 
 // ============================================================================
@@ -1062,6 +1064,8 @@ mountFundingRoutes({ route, sendJson, HttpError });
 // Same best-effort pattern: issuance falls back to an in-memory store when
 // Postgres is unavailable, so the server still boots.
 mountIssuanceRoutes({ route, sendJson, HttpError });
+mountSocialRoutes({ route, sendJson, HttpError });
+mountAnnounceRoutes({ route, sendJson, HttpError });
 
 // --- 8f. Ledger introspection (debug/demo aid — see the simulated chain) ---
 route("GET", "/api/v1/ledger/blocks", async (ctx) => {
