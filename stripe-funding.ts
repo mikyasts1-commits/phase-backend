@@ -132,7 +132,7 @@ async function insertFiatLedgerEntry(args: {
         idempotency_key, network, stripe_payment_intent_id, note)
      VALUES ($1, $2, 'fiat_deposit', 'stripe', $3, $4, 'pending', false,
              $5, 'testnet', $6, 'Stripe test-mode deposit')
-     ON CONFLICT (stripe_payment_intent_id) DO NOTHING
+     ON CONFLICT (stripe_payment_intent_id) WHERE stripe_payment_intent_id IS NOT NULL DO NOTHING
      RETURNING id, user_id, amount, currency, stripe_payment_intent_id, status, verified`,
     [id, args.userId, String(args.amountMinor), args.currency.toUpperCase(),
      idempotencyKey, args.paymentIntentId],
