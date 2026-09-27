@@ -17,6 +17,9 @@
  *      the ledger entry flips to confirmed + verified, which is what the
  *      fiat-balances endpoint sums.
  *    - Fiat balances endpoint reports credited vs pending per currency.
+ *    - Webhook endpoint (/api/v1/stripe/webhooks) receives Stripe events,
+ *      verifies the HMAC signature, and credits/fails ledger entries —
+ *      push-based confirmation so the app doesn't poll.
  *
  *  WHAT'S REAL vs WHAT'S SIMULATED
  *    - Stripe API calls are REAL (test mode — Stripe's sandbox, no real
@@ -36,10 +39,12 @@
  *    STRIPE_SECRET_KEY       Stripe test secret key (sk_test_*). Absent or
  *                            live -> all Stripe routes return 503
  *                            `stripe_not_configured`; nothing is faked.
+ *    STRIPE_WEBHOOK_SECRET   Webhook endpoint secret (whsec_*). Required
+ *                            for /api/v1/stripe/webhooks; absent -> 503.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 import { dbQuery, dbQueryOne } from "./db.js";
 
 interface MountDeps {
@@ -103,6 +108,46 @@ async function stripeApi(
   return { status: resp.status, data };
 }
 
+// --- webhook signature verification --------------------------------------
+// Stripe signs webhooks as: stripe-signature: t=<unix_ts>,v1=<hex_hmac>
+// Signed payload is "<ts>.<raw_body>", HMAC-SHA256 with the endpoint secret
+// (whsec_...). Timestamp must be within 5 minutes to block replays.
+
+function getWebhookSecret(): string | null {
+  const s = process.env.STRIPE_WEBHOOK_SECRET?.trim();
+  return s && s.startsWith("whsec_") ? s : null;
+}
+
+function verifyStripeSignature(
+  rawBody: Buffer,
+  signatureHeader: string,
+  secret: string,
+): boolean {
+  const parts: Record<string, string> = {};
+  for (const seg of signatureHeader.split(",")) {
+    const [k, v] = seg.split("=", 2);
+    if (k && v) parts[k.trim()] = v.trim();
+  }
+  const ts = Number(parts.t);
+  const v1 = parts.v1;
+  if (!Number.isFinite(ts) || !v1 || !/^[0-9a-f]+$/i.test(v1)) return false;
+  // 5-minute tolerance against replay attacks.
+  if (Math.abs(Date.now() / 1000 - ts) > 300) return false;
+  const signed = `${ts}.${rawBody.toString("utf8")}`;
+  const expected = createHmac("sha256", secret).update(signed, "utf8").digest("hex");
+  const a = Buffer.from(v1, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+async function dbMarkWebhookSeen(notificationId: string): Promise<boolean> {
+  const rows = await dbQuery<{ notification_id: string }>(
+    "INSERT INTO webhook_dedup (notification_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING notification_id",
+    [notificationId],
+  );
+  return rows.length > 0;
+}
+
 // --- ledger ---------------------------------------------------------------
 // Fiat deposits live in ledger_entries with kind='fiat_deposit'. The
 // stripe_payment_intent_id unique index makes inserts idempotent: a repeated
@@ -152,6 +197,22 @@ async function confirmFiatLedgerEntry(paymentIntentId: string): Promise<FiatLedg
     `UPDATE ledger_entries
      SET status = 'confirmed', verified = true, updated_at = now()
      WHERE stripe_payment_intent_id = $1 AND status <> 'confirmed'
+     RETURNING id, user_id, amount, currency, stripe_payment_intent_id, status, verified`,
+    [paymentIntentId],
+  );
+  if (rows.length > 0) return rows[0];
+  return dbQueryOne<FiatLedgerEntry>(
+    `SELECT id, user_id, amount, currency, stripe_payment_intent_id, status, verified
+     FROM ledger_entries WHERE stripe_payment_intent_id = $1`,
+    [paymentIntentId],
+  );
+}
+
+async function failFiatLedgerEntry(paymentIntentId: string): Promise<FiatLedgerEntry | null> {
+  const rows = await dbQuery<FiatLedgerEntry>(
+    `UPDATE ledger_entries
+     SET status = 'failed', updated_at = now()
+     WHERE stripe_payment_intent_id = $1 AND status IN ('pending', 'confirming')
      RETURNING id, user_id, amount, currency, stripe_payment_intent_id, status, verified`,
     [paymentIntentId],
   );
@@ -373,6 +434,85 @@ export function mountStripeRoutes(deps: MountDeps): void {
       userId,
       totals, // minor units per currency, e.g. { CAD: { credited: "5000", pending: "0" } }
       note: "credited = confirmed + verified fiat deposits only. Amounts are in minor units (cents).",
+    });
+  });
+
+  // --- POST /api/v1/stripe/webhooks — Stripe event notifications ---
+  // Verifies the Stripe signature (fail-closed: no secret -> 503, bad
+  // signature -> 401, ledger untouched). Handles:
+  //   payment_intent.succeeded      -> confirm + verify the ledger entry
+  //   payment_intent.payment_failed -> mark the ledger entry failed
+  //   payment_intent.canceled       -> mark the ledger entry failed
+  // Idempotent on the Stripe event id via webhook_dedup.
+  deps.route("POST", "/api/v1/stripe/webhooks", async (ctx) => {
+    const secret = getWebhookSecret();
+    if (!secret) {
+      deps.sendJson(ctx.res, 503, {
+        error: "stripe_webhook_not_configured",
+        message: "STRIPE_WEBHOOK_SECRET is not set; webhooks are refused until it is.",
+        testmode: true,
+      });
+      return;
+    }
+    const rawBody: Buffer | undefined = (ctx as { rawBody?: Buffer }).rawBody;
+    if (!rawBody || rawBody.length === 0) {
+      throw new deps.HttpError(400, "webhook_no_raw_body", "Raw request body is required for signature verification.");
+    }
+    const sigHeader = ctx.req.headers["stripe-signature"];
+    const sig = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader;
+    if (!sig || !verifyStripeSignature(rawBody, sig, secret)) {
+      throw new deps.HttpError(401, "webhook_bad_signature", "Stripe webhook signature could not be verified. Ledger untouched.");
+    }
+    const event = (ctx.body ?? {}) as { id?: string; type?: string; data?: { object?: Record<string, unknown> } };
+    const eventId = typeof event.id === "string" ? event.id : null;
+    const eventType = typeof event.type === "string" ? event.type : "";
+    if (eventId) {
+      const fresh = await dbMarkWebhookSeen(`stripe:${eventId}`);
+      if (!fresh) {
+        deps.sendJson(ctx.res, 200, { testmode: true, received: true, action: "duplicate_ignored", event_id: eventId });
+        return;
+      }
+    }
+    const obj = event.data?.object ?? {};
+    const piId = typeof obj.id === "string" && obj.id.startsWith("pi_") ? obj.id : null;
+    let action = "ignored";
+    let ledger: FiatLedgerEntry | null = null;
+    if (piId) {
+      if (eventType === "payment_intent.succeeded") {
+        // Ensure a ledger entry exists (may predate the ledger integration).
+        const existing = await dbQueryOne<FiatLedgerEntry>(
+          `SELECT id, user_id, amount, currency, stripe_payment_intent_id, status, verified
+           FROM ledger_entries WHERE stripe_payment_intent_id = $1`,
+          [piId],
+        );
+        if (!existing) {
+          const meta = (obj.metadata ?? {}) as Record<string, unknown>;
+          const metaUser = typeof meta.phase_user_id === "string" ? meta.phase_user_id : null;
+          if (metaUser && typeof obj.amount === "number" && typeof obj.currency === "string") {
+            const r = await insertFiatLedgerEntry({
+              userId: metaUser,
+              amountMinor: obj.amount,
+              currency: obj.currency,
+              paymentIntentId: piId,
+            });
+            ledger = r.entry;
+          }
+        }
+        ledger = await confirmFiatLedgerEntry(piId);
+        action = "credited";
+      } else if (eventType === "payment_intent.payment_failed" || eventType === "payment_intent.canceled") {
+        ledger = await failFiatLedgerEntry(piId);
+        action = "marked_failed";
+      }
+    }
+    deps.sendJson(ctx.res, 200, {
+      testmode: true,
+      livemode: false,
+      received: true,
+      action,
+      event_id: eventId,
+      event_type: eventType,
+      ledger: ledger ? { id: ledger.id, status: ledger.status, verified: ledger.verified } : null,
     });
   });
 }
