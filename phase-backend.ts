@@ -1149,7 +1149,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
   // with "Failed to fetch". setHeader merges with later writeHead calls.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Stripe-Signature");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Stripe-Signature, Idempotency-Key");
   res.setHeader("Access-Control-Max-Age", "86400");
 
   // Preflight short-circuit — no route needed.
