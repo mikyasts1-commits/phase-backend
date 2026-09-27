@@ -58,6 +58,7 @@ import { getUsdPerBtc, getQuote, getFeedStatus } from "./market-data.js";
 import { mountFundingRoutes } from "./crypto-funding.js";
 import { mountBtcRoutes } from "./btc-funding.js";
 import { mountIssuanceRoutes } from "./issuance.js";
+import { mountSovereignLedgerRoutes } from "./sovereign-ledger.js";
 import { mountSocialRoutes } from "./social-auth.js";
 import { mountAnnounceRoutes } from "./social-announce.js";
 import { migrate as migrateFundingDb } from "./db.js";
@@ -1108,6 +1109,11 @@ mountBtcRoutes({ route, sendJson, HttpError });
 // Same best-effort pattern: issuance falls back to an in-memory store when
 // Postgres is unavailable, so the server still boots.
 mountIssuanceRoutes({ route, sendJson, HttpError });
+
+// --- 8e-vi. Sovereign ledger (Phase 1 MVP; see sovereign-ledger.ts) ---
+// Per-user sovereign chains with Ed25519-signed transactions. In-memory only
+// (test/experimental) — Postgres swap-in and legal review still pending.
+mountSovereignLedgerRoutes({ route, sendJson, HttpError });
 
 // --- 8f. Ledger introspection (debug/demo aid — see the simulated chain) ---
 route("GET", "/api/v1/ledger/blocks", async (ctx) => {
