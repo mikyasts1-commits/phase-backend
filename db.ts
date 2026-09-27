@@ -63,7 +63,7 @@ export async function dbQueryOne<T extends QueryResultRow = QueryResultRow>(
  * IF NOT EXISTS throughout; the schema_migrations row records that the
  * version has been applied. Migrations run in filename order.
  */
-const MIGRATION_VERSIONS = ["001", "002", "003", "004", "005", "006"];
+const MIGRATION_VERSIONS = ["001", "002", "003", "004", "005", "006", "007"];
 
 export async function migrate(): Promise<void> {
   const dir = join(here, "db", "migrations");
