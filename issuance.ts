@@ -40,9 +40,10 @@ export interface IssuanceDraftInput {
   equityPublic?: number;
   equityRetained?: number;
   socialProfiles?: Array<{ platform: string; url: string }>;
+  priceUsd?: number; // issuer's starting price per whole coin, USD
 }
 
-export interface IssuanceDraft extends Required<Omit<IssuanceDraftInput, "category" | "tagline" | "valueThesis" | "equityPublic" | "equityRetained" | "socialProfiles">> {
+export interface IssuanceDraft extends Required<Omit<IssuanceDraftInput, "category" | "tagline" | "valueThesis" | "equityPublic" | "equityRetained" | "socialProfiles" | "priceUsd">> {
   id: string;
   category: string;
   tagline: string;
@@ -50,6 +51,7 @@ export interface IssuanceDraft extends Required<Omit<IssuanceDraftInput, "catego
   equityPublic: number;
   equityRetained: number;
   socialProfiles: Array<{ platform: string; url: string }>;
+  priceUsd: number; // issuer's starting price per whole coin, USD
   status: "draft" | "signed" | "minted";
   createdAt: string;
   updatedAt: string;
@@ -77,6 +79,7 @@ export interface IssuanceCoin {
   txSignature: string;
   supply: string;
   decimals: number;
+  priceUsd: number; // issuer's starting price per whole coin, USD (trade price)
   network: "sovereign";
   idempotencyKey: string;
   createdAt: string;
@@ -150,7 +153,7 @@ export function sha256Hex(s: string): string {
 // Store: Postgres when DATABASE_URL is set, in-memory fallback otherwise.
 // ---------------------------------------------------------------------------
 
-interface IssuanceStore {
+export interface IssuanceStore {
   ensureUser(userId: string, email?: string): Promise<void>;
   createDraft(d: Omit<IssuanceDraft, "id" | "status" | "createdAt" | "updatedAt">): Promise<IssuanceDraft>;
   getDraft(id: string): Promise<IssuanceDraft | null>;
@@ -159,6 +162,7 @@ interface IssuanceStore {
   getSignatureByDraft(draftId: string): Promise<IssuanceSignature | null>;
   getCoinByIdempotency(key: string): Promise<IssuanceCoin | null>;
   getCoinByDraft(draftId: string): Promise<IssuanceCoin | null>;
+  getCoinByChainId(chainId: string): Promise<IssuanceCoin | null>;
   storeCoin(c: Omit<IssuanceCoin, "id" | "createdAt" | "network">): Promise<IssuanceCoin>;
   listCoinsByUser(userId: string): Promise<IssuanceCoin[]>;
 }
@@ -182,15 +186,16 @@ class PgIssuanceStore implements IssuanceStore {
     const rows = await this.q<IssuanceDraft>(
       `INSERT INTO issuance_drafts
          (id, user_id, name, ticker, category, tagline, value_thesis, equity_public,
-          equity_retained, social_profiles, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'draft')
+          equity_retained, social_profiles, price_usd, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'draft')
        RETURNING id, user_id AS "userId", name, ticker, category, tagline,
                  value_thesis AS "valueThesis", equity_public AS "equityPublic",
                  equity_retained AS "equityRetained",
-                 social_profiles AS "socialProfiles", status,
+                 social_profiles AS "socialProfiles", price_usd AS "priceUsd",
+                 status,
                  created_at AS "createdAt", updated_at AS "updatedAt"`,
       [id, d.userId, d.name, d.ticker, d.category, d.tagline, d.valueThesis,
-       d.equityPublic, d.equityRetained, JSON.stringify(d.socialProfiles)]
+       d.equityPublic, d.equityRetained, JSON.stringify(d.socialProfiles), d.priceUsd]
     );
     return rows[0]!;
   }
@@ -200,7 +205,8 @@ class PgIssuanceStore implements IssuanceStore {
       `SELECT id, user_id AS "userId", name, ticker, category, tagline,
               value_thesis AS "valueThesis", equity_public AS "equityPublic",
               equity_retained AS "equityRetained",
-              social_profiles AS "socialProfiles", status,
+              social_profiles AS "socialProfiles", price_usd AS "priceUsd",
+              status,
               created_at AS "createdAt", updated_at AS "updatedAt"
        FROM issuance_drafts WHERE id = $1`,
       [id]
@@ -247,17 +253,22 @@ class PgIssuanceStore implements IssuanceStore {
     return rows[0] ?? null;
   }
 
+  async getCoinByChainId(chainId: string): Promise<IssuanceCoin | null> {
+    const rows = await this.q<IssuanceCoin>(`SELECT ${COIN_COLS} FROM issuance_coins WHERE mint_address = $1`, [chainId]);
+    return rows[0] ?? null;
+  }
+
   async storeCoin(c: Omit<IssuanceCoin, "id" | "createdAt" | "network">): Promise<IssuanceCoin> {
     const id = randomUUID();
     const rows = await this.q<IssuanceCoin>(
       `INSERT INTO issuance_coins
          (id, draft_id, user_id, signature_id, is_meme, name, ticker,
-          mint_address, tx_signature, supply, decimals, network, idempotency_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'sovereign',$12)
+          mint_address, tx_signature, supply, decimals, price_usd, network, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sovereign',$13)
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING ${COIN_COLS}`,
       [id, c.draftId, c.userId, c.signatureId, c.isMeme, c.name, c.ticker,
-       c.mintAddress, c.txSignature, c.supply, c.decimals, c.idempotencyKey]
+       c.mintAddress, c.txSignature, c.supply, c.decimals, c.priceUsd, c.idempotencyKey]
     );
     // Lost the race: another request with the same key already stored a coin.
     const existing = await this.getCoinByIdempotency(c.idempotencyKey);
@@ -276,7 +287,7 @@ class PgIssuanceStore implements IssuanceStore {
 const COIN_COLS = `id, draft_id AS "draftId", user_id AS "userId",
   signature_id AS "signatureId", is_meme AS "isMeme", name, ticker,
   mint_address AS "mintAddress", tx_signature AS "txSignature",
-  supply, decimals, network, idempotency_key AS "idempotencyKey",
+  supply, decimals, price_usd AS "priceUsd", network, idempotency_key AS "idempotencyKey",
   created_at AS "createdAt"`;
 
 class MemoryIssuanceStore implements IssuanceStore {
@@ -315,6 +326,10 @@ class MemoryIssuanceStore implements IssuanceStore {
   }
   async getCoinByDraft(draftId: string): Promise<IssuanceCoin | null> {
     for (const c of this.coins.values()) if (c.draftId === draftId) return c;
+    return null;
+  }
+  async getCoinByChainId(chainId: string): Promise<IssuanceCoin | null> {
+    for (const c of this.coins.values()) if (c.mintAddress === chainId) return c;
     return null;
   }
   async storeCoin(c: Omit<IssuanceCoin, "id" | "createdAt" | "network">): Promise<IssuanceCoin> {
@@ -391,6 +406,11 @@ function getStore(): IssuanceStore {
 
 /** Async store accessor — every route handler must go through this. */
 function store(): Promise<IssuanceStore> {
+  return getStoreAsync();
+}
+
+/** Shared store accessor for sibling modules (marketplace settlement). */
+export function getIssuanceStore(): Promise<IssuanceStore> {
   return getStoreAsync();
 }
 
@@ -494,6 +514,11 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
             .filter((s) => s && typeof s.url === "string" && s.url.trim())
             .map((s) => ({ platform: str(s.platform).trim(), url: str(s.url).trim() }))
         : [];
+      const priceUsdRaw = body.priceUsd ?? body.price_usd;
+      const priceUsd = priceUsdRaw === undefined ? 10 : Number(priceUsdRaw);
+      if (!Number.isFinite(priceUsd) || priceUsd <= 0 || priceUsd > 1_000_000_000) {
+        throw new HttpError(422, "invalid_price", "priceUsd must be a positive number.");
+      }
 
       const s = await store();
       await s.ensureUser(userId, str(body.email) || undefined);
@@ -507,6 +532,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         equityPublic,
         equityRetained,
         socialProfiles,
+        priceUsd,
       });
       sendJson(ctx.res, 201, { ...NETWORK_ENVELOPE, draftId: draft.id, status: draft.status, draft });
     } catch (err) { fail(ctx, err); }
@@ -647,6 +673,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         txSignature: chain.genesis_hash,
         supply: String(totalShares),
         decimals: 6,
+        priceUsd: draft.priceUsd,
         idempotencyKey: key,
       });
       await s.setDraftStatus(draftId, "minted");

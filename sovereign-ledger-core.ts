@@ -219,6 +219,10 @@ interface TxRecord extends Tx {
   blockHeight?: number;
   txIndex?: number;
   confirmedAt?: number;
+  // Set only by settleFloatTransfer() (platform-operated float settlement).
+  // Never accepted from client input; applyTransfer() skips sender-signature
+  // verification for these but keeps nonce/balance/allowlist checks.
+  operatorSettled?: boolean;
 }
 
 interface ChainRecord {
@@ -441,7 +445,13 @@ function applyTransfer(chain: ChainRecord, tx: Tx): void {
     throw new LedgerError('invalid_memo', 'memo must be a string up to 256 chars');
   }
   const amt = parseAmount(amount);
-  if (!verifyTxSignature(tx)) throw new LedgerError('invalid_signature', 'signature verification failed');
+  // Platform-operated float settlement bypasses sender-signature verification:
+  // the public float is platform-custodied by design (vanity address, no
+  // keypair exists for it), and settleFloatTransfer() is the only code path
+  // that can set the operatorSettled flag — it is never accepted from client
+  // input. Nonce, balance, and allowlist checks still apply.
+  const operatorSettled = (tx as TxRecord).operatorSettled === true;
+  if (!operatorSettled && !verifyTxSignature(tx)) throw new LedgerError('invalid_signature', 'signature verification failed');
 
   const senderEntry = store.getBalanceEntry(chain.chainId, tx.sender);
   if (tx.nonce !== senderEntry.nonce + 1) {
@@ -661,6 +671,61 @@ async function submitTransaction(chainId: string, input: any): Promise<{ status:
 
     return { status: 202, body: { tx_id: record.txId, status: 'pending' } };
   });
+}
+
+// ============================================================
+// Platform-operated float settlement (marketplace trades)
+// ============================================================
+// Move coins from the chain's public float to a buyer as the coin leg of a
+// marketplace trade. The float is platform-custodied by design (fixed vanity
+// address, no keypair exists), so this is the ONLY way float coins move —
+// there is no client-submittable path. The transfer is recorded as a normal
+// TRANSFER tx (sequenced into blocks, visible in proofs/explorers) with an
+// operatorSettled marker instead of a sender signature.
+// Internal use only: never exposed as a public HTTP route.
+async function settleFloatTransfer(
+  chainId: string,
+  to: string,
+  amountBaseUnits: string,
+  memo?: string
+): Promise<{ tx_id: string; status: string }> {
+  const chain = store.chains.get(chainId);
+  if (!chain) throw new LedgerError('chain_not_found', 'unknown chain', 404);
+  if (chain.status !== 'active') throw new LedgerError('chain_not_active', 'chain is not active', 409);
+  if (!isValidAddress(to)) throw new LedgerError('invalid_recipient', 'recipient address is invalid');
+  const amt = parseAmount(amountBaseUnits, 'amount');
+  return chainLock.withLock(chainId, () => {
+    const floatEntry = store.getBalanceEntry(chainId, PUBLIC_FLOAT_ADDRESS);
+    if (floatEntry.balance < amt) {
+      throw new LedgerError('insufficient_float', 'public float has insufficient balance for this trade', 409);
+    }
+    const txId = 'tx_' + crypto.randomUUID();
+    const record: TxRecord = {
+      chainId,
+      txId,
+      type: 'TRANSFER',
+      sender: PUBLIC_FLOAT_ADDRESS,
+      nonce: computeExpectedNonce(chainId, PUBLIC_FLOAT_ADDRESS),
+      payload: { to, amount: amt.toString(), memo: memo ?? 'marketplace trade settlement' },
+      signatures: [],
+      submittedAt: Date.now(),
+      status: 'pending',
+      operatorSettled: true,
+    };
+    store.txById.set(txId, record);
+    const q = store.mempoolByChain.get(chainId) || [];
+    q.push(record);
+    store.mempoolByChain.set(chainId, q);
+    return { tx_id: txId, status: 'pending' };
+  });
+}
+
+// Read helper for settlement pre-checks: balance of any address on a chain,
+// in base units (string). Throws 404 for unknown chains.
+function getChainBalance(chainId: string, address: string): string {
+  const chain = store.chains.get(chainId);
+  if (!chain) throw new LedgerError('chain_not_found', 'unknown chain', 404);
+  return store.getBalanceEntry(chainId, address).balance.toString();
 }
 
 // ============================================================
@@ -1029,6 +1094,10 @@ export {
   stateLeaf,
   createChain,
   submitTransaction,
+  settleFloatTransfer,
+  getChainBalance,
+  isValidAddress,
+  PUBLIC_FLOAT_ADDRESS,
   startSequencerLoop,
   computeStateSnapshotAndRoot,
   serializeChain,

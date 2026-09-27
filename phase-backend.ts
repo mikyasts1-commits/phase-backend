@@ -60,6 +60,7 @@ import { mountBtcRoutes } from "./btc-funding.js";
 import { mountStripeRoutes } from "./stripe-funding.js";
 import { mountIssuanceRoutes } from "./issuance.js";
 import { mountSovereignLedgerRoutes } from "./sovereign-ledger.js";
+import { mountMarketplaceRoutes } from "./marketplace.js";
 import { mountSocialRoutes } from "./social-auth.js";
 import { mountAnnounceRoutes } from "./social-announce.js";
 import { migrate as migrateFundingDb } from "./db.js";
@@ -1116,6 +1117,12 @@ mountIssuanceRoutes({ route, sendJson, HttpError });
 // Per-user sovereign chains with Ed25519-signed transactions. In-memory only
 // (test/experimental) — Postgres swap-in and legal review still pending.
 mountSovereignLedgerRoutes({ route, sendJson, HttpError });
+
+// --- 8e-vii. Marketplace settlement (see marketplace.ts) ---
+// Two-legged trade settlement for sovereign coins: buyer's USD cash ledger
+// -> issuer's USD cash ledger, plus public float -> buyer on the coin's own
+// sovereign chain. Test rails only (topup is a test-mode faucet).
+mountMarketplaceRoutes({ route, sendJson, HttpError });
 
 // --- 8f. Ledger introspection (debug/demo aid — see the simulated chain) ---
 route("GET", "/api/v1/ledger/blocks", async (ctx) => {
