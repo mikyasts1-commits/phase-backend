@@ -1,9 +1,10 @@
 /**
- * Phase coin issuance API (testnet).
+ * Phase coin issuance API — sovereign in-house minting.
  *
  * Flow: draft -> (digitally sign issuer agreement | declare meme coin) -> mint.
- * Minting happens on Solana DEVNET via ./solana-mint.js. There is no mainnet
- * code path anywhere in this module.
+ * Minting provisions a dedicated sovereign chain per coin via
+ * ./sovereign-ledger-core.js (each coin gets its own isolated chain —
+ * that is the moat). There is no Solana/mainnet code path.
  *
  * Persistence: Postgres when DATABASE_URL is set, otherwise an in-memory
  * store (dev/test). The store interface is identical in both modes.
@@ -11,7 +12,7 @@
  * Mounted from phase-backend.ts: mountIssuanceRoutes({ route, sendJson, HttpError })
  */
 import { createHash, randomUUID } from "node:crypto";
-import { createCoinMint } from "./solana-mint.js";
+import { createChain, LedgerError } from "./sovereign-ledger-core.js";
 import { getPool } from "./db.js";
 
 // ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ export interface IssuanceCoin {
   txSignature: string;
   supply: string;
   decimals: number;
-  network: "devnet";
+  network: "sovereign";
   idempotencyKey: string;
   createdAt: string;
 }
@@ -252,7 +253,7 @@ class PgIssuanceStore implements IssuanceStore {
       `INSERT INTO issuance_coins
          (id, draft_id, user_id, signature_id, is_meme, name, ticker,
           mint_address, tx_signature, supply, decimals, network, idempotency_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'devnet',$12)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'sovereign',$12)
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING ${COIN_COLS}`,
       [id, c.draftId, c.userId, c.signatureId, c.isMeme, c.name, c.ticker,
@@ -319,7 +320,7 @@ class MemoryIssuanceStore implements IssuanceStore {
   async storeCoin(c: Omit<IssuanceCoin, "id" | "createdAt" | "network">): Promise<IssuanceCoin> {
     const existing = this.coinsByKey.get(c.idempotencyKey);
     if (existing) return existing;
-    const coin: IssuanceCoin = { ...c, network: "devnet", id: randomUUID(), createdAt: new Date().toISOString() };
+    const coin: IssuanceCoin = { ...c, network: "sovereign", id: randomUUID(), createdAt: new Date().toISOString() };
     this.coins.set(coin.id, coin);
     this.coinsByKey.set(coin.idempotencyKey, coin);
     return coin;
@@ -413,7 +414,7 @@ interface IssuanceCtx {
   body: unknown;
 }
 
-const NETWORK_ENVELOPE = { network: "devnet" as const, chain: "solana" as const };
+const NETWORK_ENVELOPE = { network: "sovereign" as const, chain: "phase" as const };
 
 function asRecord(body: unknown): Record<string, unknown> {
   return (body !== null && typeof body === "object" && !Array.isArray(body))
@@ -445,8 +446,9 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
   const HttpError = deps.HttpError as unknown as typeof IssuanceHttpError;
 
   const fail = (ctx: IssuanceCtx, err: unknown): void => {
-    const statusCode = (err as { statusCode?: number }).statusCode ?? 500;
-    const code = (err as { code?: string }).code ?? "internal_error";
+    const e = err as { statusCode?: number; status?: number; code?: string };
+    const statusCode = e.statusCode ?? e.status ?? 500;
+    const code = e.code ?? "internal_error";
     const message = err instanceof Error ? err.message : String(err);
     sendJson(ctx.res, statusCode, { ...NETWORK_ENVELOPE, error: code, message });
   };
@@ -597,6 +599,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
       }
 
       let signatureId: string | null = null;
+      let agreementHash: string | undefined;
       if (!isMeme) {
         const sig = await s.getSignatureByDraft(draftId);
         if (!sig) {
@@ -604,13 +607,33 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
             "This draft has no signed issuer agreement. Sign it first (POST /api/v1/issuance/sign), or mint as a meme coin with {\"meme\": true}.");
         }
         signatureId = sig.id;
+        agreementHash = sig.agreementHash;
       }
 
-      // Real on-chain mint on Solana devnet. Throws on failure -> 500, nothing stored.
-      const minted = await createCoinMint({
-        name: draft.name,
+      // Provision a dedicated sovereign chain for this coin in-house.
+      // Each coin gets its own isolated chain — that is the moat.
+      // Throws LedgerError on invalid input -> mapped to 4xx by fail().
+      const issuerAddress = str(body.issuerAddress);
+      if (!issuerAddress) {
+        throw new HttpError(400, "missing_issuer_address",
+          "Body must include issuerAddress: your Phase sovereign wallet address (ph1...).");
+      }
+      const totalSharesRaw = body.totalShares;
+      const totalShares = totalSharesRaw === undefined ? 100000 : Number(totalSharesRaw);
+      if (!Number.isInteger(totalShares) || totalShares < 1000) {
+        throw new HttpError(422, "invalid_total_shares", "totalShares must be a whole number >= 1000.");
+      }
+      const chain = createChain({
+        coin_name: draft.name,
         ticker: draft.ticker,
-        description: draft.tagline || draft.valueThesis || undefined,
+        total_supply: String(totalShares),
+        decimals: 6,
+        equity_public_pct: draft.equityPublic,
+        issuer_address: issuerAddress,
+        is_meme: isMeme,
+        issuance_draft_id: draftId,
+        issuance_signature_id: signatureId,
+        covenant_hash: agreementHash,
       });
 
       const coin = await s.storeCoin({
@@ -620,10 +643,10 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         isMeme,
         name: draft.name,
         ticker: draft.ticker,
-        mintAddress: minted.mintAddress,
-        txSignature: minted.txSignature,
-        supply: minted.supply,
-        decimals: minted.decimals,
+        mintAddress: chain.chain_id,
+        txSignature: chain.genesis_hash,
+        supply: String(totalShares),
+        decimals: 6,
         idempotencyKey: key,
       });
       await s.setDraftStatus(draftId, "minted");
@@ -632,7 +655,8 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         ...NETWORK_ENVELOPE,
         idempotentReplay: false,
         coin,
-        explorerUrl: `https://explorer.solana.com/address/${coin.mintAddress}?cluster=devnet`,
+        chainId: chain.chain_id,
+        genesisHash: chain.genesis_hash,
       });
     } catch (err) { fail(ctx, err); }
   });
@@ -654,11 +678,11 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
       const _st2 = await store();
       const coins = await _st2.listCoinsByUser(userId);
       const coin = coins.find((c) => c.id === ctx.params.id || c.mintAddress === ctx.params.id);
-      if (!coin) throw new HttpError(404, "coin_not_found", "No coin with that id or mint address for this user.");
+      if (!coin) throw new HttpError(404, "coin_not_found", "No coin with that id or chain id for this user.");
       sendJson(ctx.res, 200, {
         ...NETWORK_ENVELOPE,
         coin,
-        explorerUrl: `https://explorer.solana.com/address/${coin.mintAddress}?cluster=devnet`,
+        chainId: coin.mintAddress,
       });
     } catch (err) { fail(ctx, err); }
   });
