@@ -1144,6 +1144,21 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
   const fullUrl = new URL(req.url ?? "/", "http://localhost");
   const method = req.method ?? "GET";
 
+  // Global CORS: the Phase Android app (Capacitor WebView) calls this API
+  // cross-origin. Without these headers every fetch from the device fails
+  // with "Failed to fetch". setHeader merges with later writeHead calls.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Stripe-Signature");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  // Preflight short-circuit — no route needed.
+  if (method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   for (const r of routes) {
     if (r.method !== method) continue;
     const match = r.pattern.exec(fullUrl.pathname);
