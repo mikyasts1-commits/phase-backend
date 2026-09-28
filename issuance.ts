@@ -65,6 +65,10 @@ export interface IssuanceSignature {
   agreementHash: string;
   agreementText: string;
   signedAt: string;
+  /** "individual" | "entity" — which signature-block category was chosen. */
+  issuerCategory: string;
+  /** Entity signers only: office/title held. */
+  title: string | null;
 }
 
 export interface IssuanceCoin {
@@ -160,6 +164,7 @@ export interface IssuanceStore {
   setDraftStatus(id: string, status: IssuanceDraft["status"]): Promise<void>;
   storeSignature(s: Omit<IssuanceSignature, "id" | "signedAt">): Promise<IssuanceSignature>;
   getSignatureByDraft(draftId: string): Promise<IssuanceSignature | null>;
+  getSignatureById(id: string): Promise<IssuanceSignature | null>;
   getCoinByIdempotency(key: string): Promise<IssuanceCoin | null>;
   getCoinByDraft(draftId: string): Promise<IssuanceCoin | null>;
   getCoinByChainId(chainId: string): Promise<IssuanceCoin | null>;
@@ -222,12 +227,15 @@ class PgIssuanceStore implements IssuanceStore {
     const id = randomUUID();
     const rows = await this.q<IssuanceSignature>(
       `INSERT INTO issuance_signatures
-         (id, draft_id, user_id, legal_name, agreement_hash, agreement_text)
-       VALUES ($1,$2,$3,$4,$5,$6)
+         (id, draft_id, user_id, legal_name, agreement_hash, agreement_text,
+          issuer_category, title)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        RETURNING id, draft_id AS "draftId", user_id AS "userId",
                  legal_name AS "legalName", agreement_hash AS "agreementHash",
-                 agreement_text AS "agreementText", signed_at AS "signedAt"`,
-      [id, s.draftId, s.userId, s.legalName, s.agreementHash, s.agreementText]
+                 agreement_text AS "agreementText", signed_at AS "signedAt",
+                 issuer_category AS "issuerCategory", title`,
+      [id, s.draftId, s.userId, s.legalName, s.agreementHash, s.agreementText,
+       s.issuerCategory ?? "individual", s.title ?? null]
     );
     return rows[0]!;
   }
@@ -236,9 +244,22 @@ class PgIssuanceStore implements IssuanceStore {
     const rows = await this.q<IssuanceSignature>(
       `SELECT id, draft_id AS "draftId", user_id AS "userId",
               legal_name AS "legalName", agreement_hash AS "agreementHash",
-              agreement_text AS "agreementText", signed_at AS "signedAt"
+              agreement_text AS "agreementText", signed_at AS "signedAt",
+              issuer_category AS "issuerCategory", title
        FROM issuance_signatures WHERE draft_id = $1`,
       [draftId]
+    );
+    return rows[0] ?? null;
+  }
+
+  async getSignatureById(id: string): Promise<IssuanceSignature | null> {
+    const rows = await this.q<IssuanceSignature>(
+      `SELECT id, draft_id AS "draftId", user_id AS "userId",
+              legal_name AS "legalName", agreement_hash AS "agreementHash",
+              agreement_text AS "agreementText", signed_at AS "signedAt",
+              issuer_category AS "issuerCategory", title
+       FROM issuance_signatures WHERE id = $1`,
+      [id]
     );
     return rows[0] ?? null;
   }
@@ -320,6 +341,10 @@ class MemoryIssuanceStore implements IssuanceStore {
   }
   async getSignatureByDraft(draftId: string): Promise<IssuanceSignature | null> {
     return this.sigsByDraft.get(draftId) ?? null;
+  }
+  async getSignatureById(id: string): Promise<IssuanceSignature | null> {
+    for (const s of this.sigsByDraft.values()) if (s.id === id) return s;
+    return null;
   }
   async getCoinByIdempotency(key: string): Promise<IssuanceCoin | null> {
     return this.coinsByKey.get(key) ?? null;
@@ -571,6 +596,11 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
       if (body.accepted !== true) {
         throw new HttpError(422, "not_accepted", "accepted must be true: you must accept the agreement to sign it.");
       }
+      const issuerCategory = str(body.issuerCategory).trim().toLowerCase() || "individual";
+      if (issuerCategory !== "individual" && issuerCategory !== "entity") {
+        throw new HttpError(422, "invalid_issuer_category", "issuerCategory must be 'individual' or 'entity'.");
+      }
+      const title = str(body.title).trim().slice(0, 120) || null;
       const s = await store();
       const draft = await s.getDraft(draftId);
       if (!draft) throw new HttpError(404, "draft_not_found", "No draft with that id.");
@@ -585,6 +615,8 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         legalName,
         agreementHash: sha256Hex(agreementText),
         agreementText,
+        issuerCategory,
+        title,
       });
       await s.setDraftStatus(draftId, "signed");
       sendJson(ctx.res, 201, {
@@ -594,6 +626,8 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         legalName: sig.legalName,
         agreementHash: sig.agreementHash,
         signedAt: sig.signedAt,
+        issuerCategory: sig.issuerCategory,
+        title: sig.title,
       });
     } catch (err) { fail(ctx, err); }
   });

@@ -20,6 +20,7 @@
     "@solana/web3.js": "^1.99.0",
     "bitcoinjs-lib": "^7.0.2",
     "ecpair": "^3.0.2",
+    "pdf-lib": "^1.17.1",
     "pg": "^8.23.0",
     "sharp": "^0.35.4",
     "tiny-secp256k1": "^2.2.4",

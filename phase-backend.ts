@@ -61,6 +61,7 @@ import { mountStripeRoutes } from "./stripe-funding.js";
 import { mountIssuanceRoutes } from "./issuance.js";
 import { mountSovereignLedgerRoutes } from "./sovereign-ledger.js";
 import { mountMarketplaceRoutes } from "./marketplace.js";
+import { mountLegalDocsRoutes } from "./legal-docs.js";
 import { mountSocialRoutes } from "./social-auth.js";
 import { mountAnnounceRoutes } from "./social-announce.js";
 import { migrate as migrateFundingDb } from "./db.js";
@@ -1124,6 +1125,11 @@ mountSovereignLedgerRoutes({ route, sendJson, HttpError });
 // sovereign chain. Durable settlement attempts with boot reconciliation.
 // Test rails only (topup is a test-mode faucet).
 mountMarketplaceRoutes({ route, sendJson, HttpError });
+
+// --- 8e-viia. Legal documents (see legal-docs.ts) ---
+// The completed Phase Coin Minting Agreement (base PDF) plus per-signature
+// auto-populated copies (Article 20 block filled from the signature record).
+mountLegalDocsRoutes({ route });
 
 // --- 8e-viii. Boot reconciliation for interrupted settlements ---
 // Runs after mounts; the ledger restore is awaited inside.
