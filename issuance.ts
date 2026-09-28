@@ -649,7 +649,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
       if (!Number.isInteger(totalShares) || totalShares < 1000) {
         throw new HttpError(422, "invalid_total_shares", "totalShares must be a whole number >= 1000.");
       }
-      const chain = createChain({
+      const chain = await createChain({
         coin_name: draft.name,
         ticker: draft.ticker,
         total_supply: String(totalShares),

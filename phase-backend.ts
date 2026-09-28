@@ -1114,15 +1114,25 @@ mountStripeRoutes({ route, sendJson, HttpError });
 mountIssuanceRoutes({ route, sendJson, HttpError });
 
 // --- 8e-vi. Sovereign ledger (Phase 1 MVP; see sovereign-ledger.ts) ---
-// Per-user sovereign chains with Ed25519-signed transactions. In-memory only
-// (test/experimental) — Postgres swap-in and legal review still pending.
+// Per-user sovereign chains with Ed25519-signed transactions. Write-through
+// Postgres persistence (migration 008) + boot restore; legal review pending.
 mountSovereignLedgerRoutes({ route, sendJson, HttpError });
 
 // --- 8e-vii. Marketplace settlement (see marketplace.ts) ---
 // Two-legged trade settlement for sovereign coins: buyer's USD cash ledger
 // -> issuer's USD cash ledger, plus public float -> buyer on the coin's own
-// sovereign chain. Test rails only (topup is a test-mode faucet).
+// sovereign chain. Durable settlement attempts with boot reconciliation.
+// Test rails only (topup is a test-mode faucet).
 mountMarketplaceRoutes({ route, sendJson, HttpError });
+
+// --- 8e-viii. Boot reconciliation for interrupted settlements ---
+// Runs after mounts; the ledger restore is awaited inside.
+import("./marketplace.js").then((m) => {
+  if (typeof m.reconcileSettlements === "function") {
+    m.reconcileSettlements().catch((e) =>
+      console.error("[boot] settlement reconciliation failed:", e));
+  }
+}).catch((e) => console.error("[boot] marketplace import failed:", e));
 
 // --- 8f. Ledger introspection (debug/demo aid — see the simulated chain) ---
 route("GET", "/api/v1/ledger/blocks", async (ctx) => {

@@ -21,11 +21,14 @@
 import { randomUUID } from "node:crypto";
 import { getPool } from "./db.js";
 import {
+  store as ledgerStore,
+  loadLedgerFromDb,
   settleFloatTransfer,
   getChainBalance,
   isValidAddress,
   PUBLIC_FLOAT_ADDRESS,
   LedgerError,
+  auditLog,
 } from "./sovereign-ledger-core.js";
 import { getIssuanceStore, type IssuanceCoin } from "./issuance.js";
 
@@ -61,6 +64,43 @@ export interface MarketTrade {
   idempotencyKey: string;
   createdAt: string;
 }
+
+// ---------------------------------------------------------------------------
+// Durable settlement attempts — the two-legged buy as a crash-safe state
+// machine. States: started -> cash_moved -> coin_queued -> coin_confirmed.
+// Failure states: failed (nothing moved), compensated (cash moved then
+// reversed). reconcileSettlements() finishes or unwinds stuck attempts.
+// ---------------------------------------------------------------------------
+
+export type SettlementState =
+  | "started" | "cash_moved" | "coin_queued" | "coin_confirmed"
+  | "failed" | "compensated";
+
+export interface SettlementAttempt {
+  id: string;
+  idempotencyKey: string;
+  chainId: string;
+  coinId: string | null;
+  buyerUserId: string;
+  sellerUserId: string;
+  buyerAddress: string;
+  units: string;
+  priceUsd: string;
+  amountUsd: string;
+  state: SettlementState;
+  coinTxId: string | null;
+  tradeId: string | null;
+  errorCode: string | null;
+}
+
+const TERMINAL_STATES: SettlementState[] = ["coin_confirmed", "failed", "compensated"];
+const OPEN_STATES: SettlementState[] = ["started", "cash_moved", "coin_queued"];
+
+const ATTEMPT_COLS = `id, idempotency_key AS "idempotencyKey", chain_id AS "chainId",
+  coin_id AS "coinId", buyer_user_id AS "buyerUserId", seller_user_id AS "sellerUserId",
+  buyer_address AS "buyerAddress", units::text AS "units", price_usd::text AS "priceUsd",
+  amount_usd::text AS "amountUsd", state, coin_tx_id AS "coinTxId", trade_id AS "tradeId",
+  error_code AS "errorCode"`;
 
 const NETWORK_ENVELOPE = { network: "sovereign" as const, chain: "phase" as const };
 const USD = "USD";
@@ -103,6 +143,11 @@ interface MarketStore {
   recordTrade(t: Omit<MarketTrade, "id" | "createdAt">): Promise<MarketTrade>;
   listTrades(userId: string, role: "buyer" | "seller"): Promise<MarketTrade[]>;
   lifetimeSalesUsd(sellerUserId: string): Promise<string>;
+  // --- durable settlement attempts ---
+  createAttempt(a: Omit<SettlementAttempt, "id" | "state" | "coinTxId" | "tradeId" | "errorCode">): Promise<{ attempt: SettlementAttempt; created: boolean }>;
+  getAttemptByIdempotency(key: string): Promise<SettlementAttempt | null>;
+  setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string }): Promise<void>;
+  listOpenAttempts(): Promise<SettlementAttempt[]>;
 }
 
 class PgMarketStore implements MarketStore {
@@ -196,6 +241,49 @@ class PgMarketStore implements MarketStore {
     );
     return rows[0]?.total ?? "0";
   }
+
+  async createAttempt(a: Omit<SettlementAttempt, "id" | "state" | "coinTxId" | "tradeId" | "errorCode">): Promise<{ attempt: SettlementAttempt; created: boolean }> {
+    const id = randomUUID();
+    const rows = await this.q<SettlementAttempt>(
+      `INSERT INTO settlement_attempts
+         (id, idempotency_key, chain_id, coin_id, buyer_user_id, seller_user_id,
+          buyer_address, units, price_usd, amount_usd, state)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9::numeric,$10::numeric,'started')
+       ON CONFLICT (idempotency_key) DO NOTHING
+       RETURNING ${ATTEMPT_COLS}`,
+      [id, a.idempotencyKey, a.chainId, a.coinId, a.buyerUserId, a.sellerUserId,
+       a.buyerAddress, a.units, a.priceUsd, a.amountUsd]
+    );
+    if (rows[0]) return { attempt: rows[0], created: true };
+    const existing = await this.getAttemptByIdempotency(a.idempotencyKey);
+    if (!existing) throw new Error("settlement idempotency conflict without existing attempt");
+    return { attempt: existing, created: false };
+  }
+
+  async getAttemptByIdempotency(key: string): Promise<SettlementAttempt | null> {
+    const rows = await this.q<SettlementAttempt>(
+      `SELECT ${ATTEMPT_COLS} FROM settlement_attempts WHERE idempotency_key = $1`, [key]);
+    return rows[0] ?? null;
+  }
+
+  async setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string }): Promise<void> {
+    await this.q(
+      `UPDATE settlement_attempts SET state = $2,
+         coin_tx_id = COALESCE($3, coin_tx_id),
+         trade_id = COALESCE($4, trade_id),
+         error_code = COALESCE($5, error_code),
+         updated_at = now()
+       WHERE id = $1`,
+      [id, state, patch?.coinTxId ?? null, patch?.tradeId ?? null, patch?.errorCode ?? null]
+    );
+  }
+
+  async listOpenAttempts(): Promise<SettlementAttempt[]> {
+    return this.q<SettlementAttempt>(
+      `SELECT ${ATTEMPT_COLS} FROM settlement_attempts WHERE state = ANY($1) ORDER BY created_at`,
+      [OPEN_STATES]
+    );
+  }
 }
 
 const TRADE_COLS = `id, chain_id AS "chainId", coin_id AS "coinId",
@@ -255,9 +343,45 @@ class MemoryMarketStore implements MarketStore {
     for (const t of this.trades.values()) if (t.sellerUserId === sellerUserId) total += Number(t.amountUsd);
     return money6(total);
   }
+
+  private attempts = new Map<string, SettlementAttempt>();
+  private attemptsByKey = new Map<string, SettlementAttempt>();
+
+  async createAttempt(a: Omit<SettlementAttempt, "id" | "state" | "coinTxId" | "tradeId" | "errorCode">): Promise<{ attempt: SettlementAttempt; created: boolean }> {
+    const existing = this.attemptsByKey.get(a.idempotencyKey);
+    if (existing) return { attempt: existing, created: false };
+    const attempt: SettlementAttempt = {
+      ...a, id: randomUUID(), state: "started",
+      coinTxId: null, tradeId: null, errorCode: null,
+    };
+    this.attempts.set(attempt.id, attempt);
+    this.attemptsByKey.set(attempt.idempotencyKey, attempt);
+    return { attempt, created: true };
+  }
+
+  async getAttemptByIdempotency(key: string): Promise<SettlementAttempt | null> {
+    return this.attemptsByKey.get(key) ?? null;
+  }
+
+  async setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string }): Promise<void> {
+    const a = this.attempts.get(id);
+    if (!a) return;
+    a.state = state;
+    if (patch?.coinTxId) a.coinTxId = patch.coinTxId;
+    if (patch?.tradeId) a.tradeId = patch.tradeId;
+    if (patch?.errorCode) a.errorCode = patch.errorCode;
+  }
+
+  async listOpenAttempts(): Promise<SettlementAttempt[]> {
+    return [...this.attempts.values()].filter((a) => (OPEN_STATES as string[]).includes(a.state));
+  }
 }
 
 let storeInstance: MarketStore | null = null;
+/** Test hook: direct access to the market store (used by test-settlement.ts). */
+export async function getMarketStore(): Promise<MarketStore> {
+  return getStoreAsync();
+}
 async function getStoreAsync(): Promise<MarketStore> {
   if (storeInstance) return storeInstance;
   try {
@@ -268,6 +392,33 @@ async function getStoreAsync(): Promise<MarketStore> {
     storeInstance = new MemoryMarketStore();
   }
   return storeInstance;
+}
+
+// ---------------------------------------------------------------------------
+// Simple in-memory rate limiter (per route + client IP). Resets on restart;
+// sufficient for abuse-throttling test rails, not a DDoS control.
+// ---------------------------------------------------------------------------
+
+const rateBuckets = new Map<string, { n: number; reset: number }>();
+
+export function checkRateLimit(key: string, max: number, windowMs: number): boolean {
+  const now = Date.now();
+  const b = rateBuckets.get(key);
+  if (!b || now > b.reset) {
+    rateBuckets.set(key, { n: 1, reset: now + windowMs });
+    return true;
+  }
+  b.n += 1;
+  return b.n <= max;
+}
+
+function clientIp(ctx: MarketplaceCtx): string {
+  const h = ctx.req.headers;
+  const fwd = h["x-forwarded-for"] ?? h["x-real-ip"];
+  const first = Array.isArray(fwd) ? fwd[0] : fwd;
+  if (typeof first === "string" && first) return first.split(",")[0].trim();
+  const sock = (ctx.req as unknown as { socket?: { remoteAddress?: string } }).socket;
+  return sock?.remoteAddress ?? "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -305,8 +456,16 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
 
   // --- POST /api/v1/trades/buy ---
   // Body: { userId, chainId, amountUsd, buyerAddress, idempotencyKey? }
+  //
+  // Two-legged settlement as a durable state machine (settlement_attempts):
+  //   started -> cash_moved -> coin_queued -> coin_confirmed
+  // Crash between legs? The attempt row survives; reconcileSettlements()
+  // finishes or unwinds it at boot, and a retried key resumes the attempt.
   route("POST", "/api/v1/trades/buy", async (ctx) => {
     try {
+      if (!checkRateLimit(`buy:${clientIp(ctx)}`, 30, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many buy attempts — wait a minute and try again.");
+      }
       const body = asRecord(ctx.body);
       const buyerUserId = requireUserId(ctx);
       const chainId = str(body.chainId);
@@ -320,13 +479,6 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
 
       const ms = await getStoreAsync();
 
-      // Idempotent replay: same key -> original trade, no second settlement.
-      const replay = await ms.getTradeByIdempotency(key);
-      if (replay) {
-        sendJson(ctx.res, 200, { ...NETWORK_ENVELOPE, idempotentReplay: true, trade: replay });
-        return;
-      }
-
       const issuance = await getIssuanceStore();
       const coin: IssuanceCoin | null = await issuance.getCoinByChainId(chainId);
       if (!coin) throw new HttpError(404, "coin_not_found", "No issued coin for this chain.");
@@ -335,6 +487,14 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         throw new HttpError(422, "coin_not_priced", "This coin has no trade price yet.");
       }
       const sellerUserId = coin.userId;
+
+      // Self-trade guard: the issuer and buyer must be different accounts.
+      // (Buys where both sides are the same account would be a self-transfer
+      // that inflates volume and lifetime sales.)
+      if (buyerUserId === sellerUserId) {
+        throw new HttpError(422, "self_trade",
+          "You can't buy your own coin — switch to a different account to trade it.");
+      }
 
       // units: whole coins only in v1 (the chain's base unit is one whole
       // coin — supply/balances are stored and displayed as whole shares).
@@ -352,20 +512,79 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
           "The public float doesn't have enough coins left for this purchase.");
       }
 
-      // Money leg: buyer -> issuer, atomic in the store.
-      await ms.transfer(buyerUserId, sellerUserId, USD, chargedUsd);
+      // Idempotent attempt: same key -> resume or replay, never double-settle.
+      let attempt: SettlementAttempt;
+      {
+        const { attempt: a, created } = await ms.createAttempt({
+          idempotencyKey: key,
+          chainId,
+          coinId: coin.id,
+          buyerUserId,
+          sellerUserId,
+          buyerAddress,
+          units: money6(units),
+          priceUsd: money6(priceUsd),
+          amountUsd: chargedUsd,
+        });
+        attempt = a;
+        if (!created) {
+          if (attempt.tradeId) {
+            const replay = await ms.getTradeByIdempotency(key);
+            if (replay) {
+              sendJson(ctx.res, 200, { ...NETWORK_ENVELOPE, idempotentReplay: true, trade: replay });
+              return;
+            }
+          }
+          if ((TERMINAL_STATES as string[]).includes(attempt.state)) {
+            throw new HttpError(409, "already_attempted",
+              "This purchase was already attempted and did not complete. Use a new idempotency key.");
+          }
+          if (attempt.state !== "started" && attempt.state !== "cash_moved" && attempt.state !== "coin_queued") {
+            throw new HttpError(409, "settlement_in_progress",
+              "This purchase is already being processed — wait a moment and check history.");
+          }
+          // else: resume the crashed attempt from its recorded state.
+        }
+      }
+      await auditLog(buyerUserId, "settlement_started", "settlement", attempt.id,
+        { chainId, units, amountUsd: chargedUsd });
 
-      // Coin leg: float -> buyer on the sovereign chain.
-      let txId: string;
-      try {
-        const settled = await settleFloatTransfer(chainId, buyerAddress, unitsBase.toString(),
-          `marketplace buy ${units} ${coin.ticker}`);
-        txId = settled.tx_id;
-      } catch (err) {
-        // Compensate: unwind the money leg, best effort.
-        try { await ms.transfer(sellerUserId, buyerUserId, USD, chargedUsd); } catch { /* log below */ }
-        console.error("[marketplace] coin leg failed after money leg; compensated:", (err as Error).message);
-        throw err;
+      // Money leg: buyer -> issuer, atomic in the store. Skipped when
+      // resuming an attempt that already moved cash.
+      if (attempt.state === "started") {
+        try {
+          await ms.transfer(buyerUserId, sellerUserId, USD, chargedUsd);
+        } catch (err) {
+          await ms.setAttemptState(attempt.id, "failed",
+            { errorCode: (err as { code?: string }).code ?? "cash_leg_failed" });
+          throw err;
+        }
+        await ms.setAttemptState(attempt.id, "cash_moved");
+        attempt.state = "cash_moved";
+        await auditLog(buyerUserId, "settlement_cash_moved", "settlement", attempt.id,
+          { amountUsd: chargedUsd, sellerUserId });
+      }
+
+      // Coin leg: float -> buyer on the sovereign chain. Skipped when
+      // resuming an attempt that already queued the coin transfer.
+      let txId = attempt.coinTxId;
+      if (attempt.state === "cash_moved") {
+        try {
+          const settled = await settleFloatTransfer(chainId, buyerAddress, unitsBase.toString(),
+            `marketplace buy ${units} ${coin.ticker}`);
+          txId = settled.tx_id;
+        } catch (err) {
+          // Compensate: unwind the money leg, best effort.
+          try { await ms.transfer(sellerUserId, buyerUserId, USD, chargedUsd); } catch { /* logged below */ }
+          await ms.setAttemptState(attempt.id, "compensated",
+            { errorCode: (err as { code?: string }).code ?? "coin_leg_failed" });
+          console.error("[marketplace] coin leg failed after money leg; compensated:", (err as Error).message);
+          throw err;
+        }
+        await ms.setAttemptState(attempt.id, "coin_queued", { coinTxId: txId! });
+        attempt.state = "coin_queued";
+        attempt.coinTxId = txId;
+        await auditLog(buyerUserId, "settlement_coin_queued", "settlement", attempt.id, { txId });
       }
 
       const trade = await ms.recordTrade({
@@ -380,6 +599,9 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         txId,
         idempotencyKey: key,
       });
+      await ms.setAttemptState(attempt.id, "coin_confirmed", { tradeId: trade.id, coinTxId: txId ?? undefined });
+      await auditLog(buyerUserId, "trade_recorded", "trade", trade.id,
+        { chainId, units, amountUsd: chargedUsd, txId });
 
       const buyerBalance = await ms.getBalance(buyerUserId, USD);
       sendJson(ctx.res, 201, {
@@ -425,6 +647,9 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
   // Test rails only. Never wire to real money.
   route("POST", "/api/v1/trades/topup", async (ctx) => {
     try {
+      if (!checkRateLimit(`topup:${clientIp(ctx)}`, 10, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many top-up requests — wait a minute and try again.");
+      }
       const body = asRecord(ctx.body);
       const userId = requireUserId(ctx);
       const amountUsd = parsePositiveMoney(body.amountUsd, "amountUsd", 100_000);
@@ -439,4 +664,108 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       });
     } catch (err) { fail(ctx, err); }
   });
+}
+
+// ---------------------------------------------------------------------------
+// Boot reconciliation — finish or unwind settlements stuck by a crash.
+// Call once at startup, after the ledger has been restored from Postgres.
+// ---------------------------------------------------------------------------
+
+export async function reconcileSettlements(): Promise<{ finished: number; compensated: number; failed: number }> {
+  const result = { finished: 0, compensated: 0, failed: 0 };
+  let ms: MarketStore;
+  try {
+    ms = await getStoreAsync();
+  } catch (e) {
+    console.error("[marketplace] reconcile: store unavailable", e);
+    return result;
+  }
+  // Make sure the in-memory ledger (tx statuses) is rebuilt first.
+  try { await loadLedgerFromDb(); } catch { /* ledger load logs on its own */ }
+
+  let open: SettlementAttempt[];
+  try {
+    open = await ms.listOpenAttempts();
+  } catch (e) {
+    console.error("[marketplace] reconcile: cannot list attempts", e);
+    return result;
+  }
+  if (open.length === 0) return result;
+  console.log(`[marketplace] reconciling ${open.length} open settlement(s)`);
+
+  for (const a of open) {
+    try {
+      if (a.state === "started") {
+        // Nothing moved — safe to abandon.
+        await ms.setAttemptState(a.id, "failed", { errorCode: "abandoned_at_boot" });
+        result.failed++;
+        continue;
+      }
+      if (a.state === "cash_moved") {
+        // Cash moved, coin leg never queued — retry the coin leg once.
+        const unitsBase = BigInt(Math.round(Number(a.units)));
+        let floatBal: bigint;
+        try {
+          floatBal = BigInt(getChainBalance(a.chainId, PUBLIC_FLOAT_ADDRESS));
+        } catch {
+          floatBal = 0n;
+        }
+        if (floatBal < unitsBase) {
+          try { await ms.transfer(a.sellerUserId, a.buyerUserId, USD, a.amountUsd); } catch { /* best effort */ }
+          await ms.setAttemptState(a.id, "compensated", { errorCode: "insufficient_float_on_retry" });
+          result.compensated++;
+          continue;
+        }
+        try {
+          const settled = await settleFloatTransfer(a.chainId, a.buyerAddress, unitsBase.toString(),
+            "reconciled marketplace buy");
+          await ms.setAttemptState(a.id, "coin_queued", { coinTxId: settled.tx_id });
+          result.finished++;
+        } catch (err) {
+          try { await ms.transfer(a.sellerUserId, a.buyerUserId, USD, a.amountUsd); } catch { /* best effort */ }
+          await ms.setAttemptState(a.id, "compensated",
+            { errorCode: (err as { code?: string }).code ?? "coin_leg_failed" });
+          result.compensated++;
+        }
+        continue;
+      }
+      if (a.state === "coin_queued") {
+        // Coin tx was queued — check whether it confirmed.
+        const tx = a.coinTxId ? ledgerStore.txById.get(a.coinTxId) : undefined;
+        if (tx && tx.status === "confirmed") {
+          if (!a.tradeId) {
+            const trade = await ms.recordTrade({
+              chainId: a.chainId,
+              coinId: a.coinId ?? "",
+              buyerUserId: a.buyerUserId,
+              sellerUserId: a.sellerUserId,
+              units: a.units,
+              priceUsd: a.priceUsd,
+              amountUsd: a.amountUsd,
+              buyerAddress: a.buyerAddress,
+              txId: a.coinTxId,
+              idempotencyKey: a.idempotencyKey,
+            });
+            await ms.setAttemptState(a.id, "coin_confirmed", { tradeId: trade.id });
+          } else {
+            await ms.setAttemptState(a.id, "coin_confirmed");
+          }
+          result.finished++;
+        } else if (!tx || tx.status === "failed") {
+          // Coin never landed — unwind the cash.
+          try { await ms.transfer(a.sellerUserId, a.buyerUserId, USD, a.amountUsd); } catch { /* best effort */ }
+          await ms.setAttemptState(a.id, "compensated", { errorCode: "coin_tx_failed" });
+          result.compensated++;
+        }
+        // else still pending — the sequencer will confirm it from the
+        // rehydrated mempool; leave the attempt open.
+        continue;
+      }
+    } catch (err) {
+      console.error(`[marketplace] reconcile failed for attempt ${a.id}:`, (err as Error).message);
+    }
+  }
+  console.log(`[marketplace] reconcile done: ${JSON.stringify(result)}`);
+  await auditLog("system", "settlements_reconciled", "settlements", undefined, result);
+  return result;
 }

@@ -17,6 +17,7 @@ import {
   createChain,
   submitTransaction,
   startSequencerLoop,
+  loadLedgerFromDb,
   serializeChain,
   serializeTx,
   serializeBlock,
@@ -57,7 +58,7 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   // POST /api/v1/ledger/chains — create a sovereign chain + genesis block
   route("POST", `${PREFIX}/chains`, async (ctx: LedgerCtx) => {
     try {
-      const result = createChain(ctx.body);
+      const result = await createChain(ctx.body);
       sendJson(ctx.res, 201, result);
     } catch (err) {
       fail(ctx, err);
@@ -237,7 +238,11 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
     }
   });
 
-  // Start the sequencer (block production loop). Runs once per process.
+  // Rebuild in-memory ledger state from Postgres (chains survive restarts),
+  // then start the sequencer (block production loop). Runs once per process.
+  loadLedgerFromDb()
+    .then((s) => console.log(`[sovereign-ledger] restored ${s.chains} chains from Postgres`))
+    .catch((e) => console.error("[sovereign-ledger] restore failed", e));
   startSequencerLoop();
   console.log("[sovereign-ledger] mounted at /api/v1/sovereign/*, sequencer started");
 }

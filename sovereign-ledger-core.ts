@@ -322,7 +322,269 @@ class KeyedAsyncLock {
 
 const store = new Store();
 const chainLock = new KeyedAsyncLock();
-const sequencerKeys = crypto.generateKeyPairSync('ed25519');
+let sequencerKeys = crypto.generateKeyPairSync('ed25519');
+
+// ============================================================
+// Postgres persistence — write-through + boot load (migration 008)
+// ============================================================
+// The in-memory Store above stays the hot path. Every mutation persists
+// the affected rows; loadLedgerFromDb() rebuilds the Store at boot so
+// sovereign chains survive backend restarts (previously wiped on every
+// Render restart/deploy). All helpers are no-ops when DATABASE_URL is
+// unset or the 008 tables are absent (standalone mode).
+
+let _persistPool: any = null;
+let _persistReady: Promise<any> | null = null;
+
+function persistPoolAsync(): Promise<any> {
+  if (!_persistReady) {
+    _persistReady = (async () => {
+      try {
+        const mod: any = await import('./db.js');
+        const pool = mod.getPool();
+        await pool.query('SELECT 1');
+        const t = await pool.query(
+          "SELECT 1 FROM information_schema.tables WHERE table_name = 'sovereign_chains'"
+        );
+        if (t.rowCount === 0) return null;
+        _persistPool = pool;
+        return pool;
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return _persistReady;
+}
+
+function persistLog(err: unknown, what: string) {
+  console.error(`[ledger-persist] ${what}:`, err instanceof Error ? err.message : String(err));
+}
+
+async function persistChainRow(chainId: string): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  const c = store.chains.get(chainId);
+  if (!c) return;
+  try {
+    await pool.query(
+      `INSERT INTO sovereign_chains (chain_id, coin_name, ticker, genesis_hash, status,
+        total_supply, current_supply, decimals, equity_public_pct, equity_retained_pct,
+        issuer_address, transfer_rules, covenant_hash, is_meme,
+        issuance_draft_id, issuance_signature_id, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       ON CONFLICT (chain_id) DO UPDATE SET
+         genesis_hash = EXCLUDED.genesis_hash, status = EXCLUDED.status,
+         current_supply = EXCLUDED.current_supply,
+         transfer_rules = EXCLUDED.transfer_rules, covenant_hash = EXCLUDED.covenant_hash`,
+      [c.chainId, c.coinName, c.ticker, c.genesisHash, c.status,
+        c.totalSupply.toString(), c.currentSupply.toString(), c.decimals,
+        c.equityPublicPct, c.equityRetainedPct, c.issuerAddress,
+        JSON.stringify(c.transferRules ?? {}), c.covenantHash, c.isMeme,
+        c.issuanceDraftId, c.issuanceSignatureId,
+        new Date(c.createdAt).toISOString()]
+    );
+  } catch (e) { persistLog(e, 'persistChainRow'); }
+}
+
+async function persistBlockRow(block: BlockRecord): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO sovereign_blocks (chain_id, height, prev_hash, timestamp_ms, tx_root,
+        state_root, tx_count, header_hash, sequencer_sig, transactions, state_snapshot)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
+       ON CONFLICT (chain_id, height) DO NOTHING`,
+      [block.chainId, block.height, block.prevHash, block.timestampMs, block.txRoot,
+        block.stateRoot, block.txCount, block.headerHash, block.sequencerSig,
+        JSON.stringify(block.transactions), JSON.stringify(block.stateSnapshot)]
+    );
+  } catch (e) { persistLog(e, 'persistBlockRow'); }
+}
+
+async function persistBalances(chainId: string): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  const entries = store.balances.get(chainId);
+  if (!entries || entries.size === 0) return;
+  try {
+    const addrs = [...entries.keys()];
+    const bals = addrs.map((a) => entries.get(a)!.balance.toString());
+    const nonces = addrs.map((a) => entries.get(a)!.nonce);
+    await pool.query(
+      `INSERT INTO sovereign_balances (chain_id, address, balance, nonce)
+       SELECT $1, u.addr, u.bal::numeric, u.nonce
+       FROM unnest($2::text[], $3::text[], $4::int[]) AS u(addr, bal, nonce)
+       ON CONFLICT (chain_id, address) DO UPDATE SET
+         balance = EXCLUDED.balance, nonce = EXCLUDED.nonce`,
+      [chainId, addrs, bals, nonces]
+    );
+  } catch (e) { persistLog(e, 'persistBalances'); }
+}
+
+async function persistTxRow(tx: TxRecord): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO sovereign_txs (tx_id, chain_id, type, sender, nonce, payload, signatures,
+        submitted_at, status, error_code, block_height, tx_index, confirmed_at, operator_settled)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (tx_id) DO UPDATE SET
+         status = EXCLUDED.status, error_code = EXCLUDED.error_code,
+         block_height = EXCLUDED.block_height, tx_index = EXCLUDED.tx_index,
+         confirmed_at = EXCLUDED.confirmed_at`,
+      [tx.txId, tx.chainId, tx.type, tx.sender, tx.nonce,
+        JSON.stringify(tx.payload ?? {}), JSON.stringify(tx.signatures ?? []),
+        tx.submittedAt, tx.status, tx.errorCode ?? null,
+        tx.blockHeight ?? null, tx.txIndex ?? null, tx.confirmedAt ?? null,
+        !!tx.operatorSettled]
+    );
+  } catch (e) { persistLog(e, 'persistTxRow'); }
+}
+
+async function persistMempoolPut(tx: TxRecord): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO sovereign_mempool (tx_id, chain_id, tx) VALUES ($1,$2,$3::jsonb)
+       ON CONFLICT (tx_id) DO NOTHING`,
+      [tx.txId, tx.chainId, JSON.stringify(tx)]
+    );
+  } catch (e) { persistLog(e, 'persistMempoolPut'); }
+}
+
+async function persistMempoolDel(txId: string): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  try {
+    await pool.query(`DELETE FROM sovereign_mempool WHERE tx_id = $1`, [txId]);
+  } catch (e) { persistLog(e, 'persistMempoolDel'); }
+}
+
+// The sequencer key is stable across restarts so blocks stay verifiable.
+async function loadOrCreateSequencerKey(): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  try {
+    const r = await pool.query(`SELECT value FROM sovereign_meta WHERE key = 'sequencer_jwk'`);
+    if (r.rowCount && r.rows[0]?.value) {
+      const jwk = JSON.parse(r.rows[0].value);
+      const priv = crypto.createPrivateKey({ key: jwk, format: 'jwk' });
+      sequencerKeys = { privateKey: priv, publicKey: crypto.createPublicKey(priv) } as typeof sequencerKeys;
+      return;
+    }
+    const jwk = sequencerKeys.privateKey.export({ format: 'jwk' });
+    await pool.query(
+      `INSERT INTO sovereign_meta (key, value) VALUES ('sequencer_jwk', $1)
+       ON CONFLICT (key) DO NOTHING`,
+      [JSON.stringify(jwk)]
+    );
+  } catch (e) { persistLog(e, 'sequencer key'); }
+}
+
+/** Rebuild the in-memory Store from Postgres. Call once at boot, before
+ *  the sequencer starts. No-op when persistence is unavailable. Safe to
+ *  call multiple times — the load runs once per process. */
+let _ledgerLoadPromise: Promise<{ chains: number; blocks: number; mempool: number }> | null = null;
+export function loadLedgerFromDb(): Promise<{ chains: number; blocks: number; mempool: number }> {
+  if (!_ledgerLoadPromise) _ledgerLoadPromise = loadLedgerFromDbInner();
+  return _ledgerLoadPromise;
+}
+
+async function loadLedgerFromDbInner(): Promise<{ chains: number; blocks: number; mempool: number }> {
+  const pool = await persistPoolAsync();
+  if (!pool) return { chains: 0, blocks: 0, mempool: 0 };
+  try {
+    await loadOrCreateSequencerKey();
+
+    const chainRows = await pool.query(`SELECT * FROM sovereign_chains ORDER BY created_at`);
+    for (const r of chainRows.rows) {
+      const chain: ChainRecord = {
+        chainId: r.chain_id, coinName: r.coin_name, ticker: r.ticker,
+        genesisHash: r.genesis_hash, status: r.status,
+        totalSupply: BigInt(r.total_supply), currentSupply: BigInt(r.current_supply),
+        decimals: r.decimals, equityPublicPct: r.equity_public_pct,
+        equityRetainedPct: r.equity_retained_pct, issuerAddress: r.issuer_address,
+        transferRules: r.transfer_rules ?? {}, covenantHash: r.covenant_hash,
+        isMeme: !!r.is_meme, issuanceDraftId: r.issuance_draft_id,
+        issuanceSignatureId: r.issuance_signature_id,
+        createdAt: new Date(r.created_at).getTime(),
+      };
+      store.chains.set(chain.chainId, chain);
+      if (chain.status === 'active') store.tickerIndex.set(chain.ticker, chain.chainId);
+    }
+
+    const balRows = await pool.query(`SELECT chain_id, address, balance, nonce FROM sovereign_balances`);
+    for (const r of balRows.rows) {
+      let m = store.balances.get(r.chain_id);
+      if (!m) { m = new Map(); store.balances.set(r.chain_id, m); }
+      m.set(r.address, { balance: BigInt(r.balance), nonce: r.nonce });
+    }
+
+    const blockRows = await pool.query(`SELECT * FROM sovereign_blocks ORDER BY chain_id, height`);
+    let blockCount = 0;
+    for (const r of blockRows.rows) {
+      const block: BlockRecord = {
+        chainId: r.chain_id, height: r.height, prevHash: r.prev_hash,
+        timestampMs: Number(r.timestamp_ms), txRoot: r.tx_root, stateRoot: r.state_root,
+        txCount: r.tx_count, headerHash: r.header_hash, sequencerSig: r.sequencer_sig,
+        transactions: r.transactions ?? [], stateSnapshot: r.state_snapshot ?? [],
+      };
+      let arr = store.blocksByChain.get(block.chainId);
+      if (!arr) { arr = []; store.blocksByChain.set(block.chainId, arr); }
+      arr.push(block);
+      blockCount++;
+    }
+
+    const txRows = await pool.query(`SELECT * FROM sovereign_txs`);
+    for (const r of txRows.rows) {
+      const tx: TxRecord = {
+        chainId: r.chain_id, txId: r.tx_id, type: r.type, sender: r.sender,
+        nonce: r.nonce, payload: r.payload ?? {}, signatures: r.signatures ?? [],
+        submittedAt: Number(r.submitted_at), status: r.status,
+        errorCode: r.error_code ?? undefined, blockHeight: r.block_height ?? undefined,
+        txIndex: r.tx_index ?? undefined,
+        confirmedAt: r.confirmed_at != null ? Number(r.confirmed_at) : undefined,
+        operatorSettled: !!r.operator_settled,
+      };
+      store.txById.set(tx.txId, tx);
+    }
+
+    const memRows = await pool.query(`SELECT tx FROM sovereign_mempool ORDER BY enqueued_at`);
+    let memCount = 0;
+    for (const r of memRows.rows) {
+      const tx = r.tx as TxRecord;
+      if (!tx || !tx.txId || !tx.chainId) continue;
+      let q = store.mempoolByChain.get(tx.chainId);
+      if (!q) { q = []; store.mempoolByChain.set(tx.chainId, q); }
+      q.push(tx);
+      if (!store.txById.has(tx.txId)) store.txById.set(tx.txId, tx);
+      memCount++;
+    }
+
+    console.log(`[ledger-persist] loaded ${chainRows.rows.length} chains, ${blockCount} blocks, ${memCount} mempool txs`);
+    return { chains: chainRows.rows.length, blocks: blockCount, mempool: memCount };
+  } catch (e) {
+    persistLog(e, 'loadLedgerFromDb');
+    return { chains: 0, blocks: 0, mempool: 0 };
+  }
+}
+
+/** Append-only audit entry. No-op when persistence is unavailable. */
+export async function auditLog(actor: string, action: string, entity?: string, entityId?: string, detail?: Record<string, any>): Promise<void> {
+  const pool = await persistPoolAsync();
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (actor, action, entity, entity_id, detail)
+       VALUES ($1,$2,$3,$4,$5::jsonb)`,
+      [actor, action, entity ?? null, entityId ?? null, JSON.stringify(detail ?? {})]
+    );
+  } catch (e) { persistLog(e, 'auditLog'); }
+}
 
 // ============================================================
 // Signing / verification (spec Section 9.2, 9.5)
@@ -510,7 +772,7 @@ function applyBurn(chain: ChainRecord, tx: Tx): void {
 // Chain Registry — POST /chains creates + applies GENESIS in one step
 // (spec Section 11.1, 12.1: Genesis Service is the only GENESIS submitter)
 // ============================================================
-function createChain(body: any): { chain_id: string; genesis_hash: string; ticker: string } {
+async function createChain(body: any): Promise<{ chain_id: string; genesis_hash: string; ticker: string }> {
   const { coin_name, ticker, total_supply, decimals, equity_public_pct, issuer_address, transfer_rules, covenant_hash, is_meme, issuance_draft_id, issuance_signature_id } = body || {};
 
   if (typeof coin_name !== 'string' || !coin_name.trim()) throw new LedgerError('invalid_coin_name', 'coin_name is required');
@@ -603,6 +865,13 @@ function createChain(body: any): { chain_id: string; genesis_hash: string; ticke
   store.blocksByChain.set(chainId, [block]);
   chain.genesisHash = headerHash.toString('hex');
 
+  // Durable from birth: chain row, genesis block, opening balances, genesis tx.
+  await persistChainRow(chainId);
+  await persistBlockRow(block);
+  await persistBalances(chainId);
+  await persistTxRow(genesisTx);
+  await auditLog(chain.issuerAddress, 'chain_created', 'chain', chainId, { ticker, totalSupply: totalSupply.toString() });
+
   return { chain_id: chainId, genesis_hash: chain.genesisHash, ticker };
 }
 
@@ -657,7 +926,7 @@ async function submitTransaction(chainId: string, input: any): Promise<{ status:
   // both read the same expected nonce before either is inserted, and one
   // gets spuriously rejected with bad_nonce. This is a liveness bug, not a
   // double-spend hole — but it makes the API unreliable under concurrency.
-  return chainLock.withLock(chainId, () => {
+  return chainLock.withLock(chainId, async () => {
     const expectedNonce = computeExpectedNonce(chainId, tx.sender);
     if (tx.nonce !== expectedNonce) {
       return { status: 409, body: { error: 'bad_nonce', expected: expectedNonce, got: tx.nonce } };
@@ -668,6 +937,9 @@ async function submitTransaction(chainId: string, input: any): Promise<{ status:
     const q = store.mempoolByChain.get(chainId) || [];
     q.push(record);
     store.mempoolByChain.set(chainId, q);
+    await persistTxRow(record);
+    await persistMempoolPut(record);
+    await auditLog(tx.sender, 'tx_submitted', 'tx', record.txId, { chainId, type: tx.type });
 
     return { status: 202, body: { tx_id: record.txId, status: 'pending' } };
   });
@@ -694,7 +966,7 @@ async function settleFloatTransfer(
   if (chain.status !== 'active') throw new LedgerError('chain_not_active', 'chain is not active', 409);
   if (!isValidAddress(to)) throw new LedgerError('invalid_recipient', 'recipient address is invalid');
   const amt = parseAmount(amountBaseUnits, 'amount');
-  return chainLock.withLock(chainId, () => {
+  return chainLock.withLock(chainId, async () => {
     const floatEntry = store.getBalanceEntry(chainId, PUBLIC_FLOAT_ADDRESS);
     if (floatEntry.balance < amt) {
       throw new LedgerError('insufficient_float', 'public float has insufficient balance for this trade', 409);
@@ -716,6 +988,9 @@ async function settleFloatTransfer(
     const q = store.mempoolByChain.get(chainId) || [];
     q.push(record);
     store.mempoolByChain.set(chainId, q);
+    await persistTxRow(record);
+    await persistMempoolPut(record);
+    await auditLog('platform', 'float_transfer_queued', 'tx', txId, { chainId, to, amount: amt.toString() });
     return { tx_id: txId, status: 'pending' };
   });
 }
@@ -732,7 +1007,7 @@ function getChainBalance(chainId: string, address: string): string {
 // Sequencer — block production (spec Section 6.2 steps 4-5, 8.1)
 // ============================================================
 function produceBlockForChain(chainId: string): Promise<void> {
-  return chainLock.withLock(chainId, () => {
+  return chainLock.withLock(chainId, async () => {
     const pending = store.mempoolByChain.get(chainId) || [];
     if (pending.length === 0) return;
     const batch = pending.splice(0, MAX_TX_PER_BLOCK);
@@ -786,6 +1061,17 @@ function produceBlockForChain(chainId: string): Promise<void> {
     const blocks = store.blocksByChain.get(chainId) || [];
     blocks.push(block);
     store.blocksByChain.set(chainId, blocks);
+
+    // Write-through: block, post-block balances, chain (supply may move),
+    // every tx in the batch (confirmed AND failed), and mempool cleanup.
+    await persistBlockRow(block);
+    await persistBalances(chainId);
+    await persistChainRow(chainId);
+    for (const tx of batch) {
+      await persistTxRow(tx);
+      await persistMempoolDel(tx.txId);
+    }
+    await auditLog('sequencer', 'block_sealed', 'block', `${chainId}:${height}`, { txCount: applied.length });
   });
 }
 
@@ -928,7 +1214,7 @@ const server = http.createServer(async (req, res) => {
     if (segs[0] === 'healthz') return json(res, 200, { ok: true, chains: store.chains.size });
 
     const auth = checkAuth(req);
-    if (!auth.ok) return json(res, auth.status, auth.body);
+    if (!auth.ok) return json(res, (auth as { status: number }).status, (auth as { body: any }).body);
 
     if (segs[0] !== 'chains') return json(res, 404, { error: 'not_found' });
 
