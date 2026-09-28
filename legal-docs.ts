@@ -5,7 +5,7 @@
  *   The completed (final) minting agreement — the authoritative terms the
  *   app links from the Sign & Mint page ("View terms and conditions").
  *
- * GET /api/v1/legal/minting-agreement/signed/:signatureId.pdf
+ * GET /api/v1/legal/minting-agreement/signed/:signatureId
  *   The same agreement with the Article 20 signature block auto-populated
  *   from the signature record: printed legal name, category X
  *   (Individual / Entity), electronic signature (the typed legal name —
@@ -122,7 +122,7 @@ export function mountLegalDocsRoutes(deps: LegalDocsMountDeps): void {
     }
   });
 
-  route("GET", "/api/v1/legal/minting-agreement/signed/:signatureId.pdf", async (ctx) => {
+  route("GET", "/api/v1/legal/minting-agreement/signed/:signatureId", async (ctx) => {
     try {
       const signatureId = String(ctx.params?.signatureId || "");
       if (!signatureId) throw Object.assign(new Error("missing id"), { statusCode: 400, code: "missing_id" });
