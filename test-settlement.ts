@@ -84,7 +84,7 @@ async function main() {
     draftId: "draft-test", userId: "issuer-1", signatureId: "sig-test",
     isMeme: true, name: "Test Coin", ticker: "TST1", mintAddress: chainId,
     txSignature: chain.genesis_hash, supply: "100000", decimals: 6,
-    priceUsd: "10", idempotencyKey: "coin-test-1",
+    priceUsd: "10", issuerAddress: issuerAddr, idempotencyKey: "coin-test-1",
   });
   ok("coin seeded with price", coin.priceUsd === "10");
 
@@ -131,9 +131,11 @@ async function main() {
 
   // --- 7. resume after simulated crash (attempt stuck at started) ----------------
   const { attempt } = await ms.createAttempt({
-    idempotencyKey: "key-crash-1", chainId, coinId: coin.id,
+    idempotencyKey: "key-crash-1", kind: "buy", chainId, coinId: coin.id,
     buyerUserId: buyer, sellerUserId: "issuer-1", buyerAddress: buyerAddr,
     units: "10.000000", priceUsd: "10.000000", amountUsd: "100.000000",
+    offerChainId: null, offerCoinId: null, offerUnits: null, offerTxId: null,
+    sellerAddress: null,
   });
   ok("crash attempt starts at started", attempt.state === "started");
   // Simulate the process dying right after the attempt row was written:
@@ -148,9 +150,11 @@ async function main() {
 
   // --- 8. reconcile: stuck `started` attempt -> failed ---------------------------
   await ms.createAttempt({
-    idempotencyKey: "key-recon-1", chainId, coinId: coin.id,
+    idempotencyKey: "key-recon-1", kind: "buy", chainId, coinId: coin.id,
     buyerUserId: buyer, sellerUserId: "issuer-1", buyerAddress: buyerAddr,
     units: "10.000000", priceUsd: "10.000000", amountUsd: "100.000000",
+    offerChainId: null, offerCoinId: null, offerUnits: null, offerTxId: null,
+    sellerAddress: null,
   });
   const recon = await reconcileSettlements();
   ok("reconcile abandons started attempt",
@@ -159,9 +163,11 @@ async function main() {
 
   // --- 9. reconcile: stuck `cash_moved` attempt -> coin leg retried ----------------
   const c2 = await ms.createAttempt({
-    idempotencyKey: "key-recon-2", chainId, coinId: coin.id,
+    idempotencyKey: "key-recon-2", kind: "buy", chainId, coinId: coin.id,
     buyerUserId: buyer, sellerUserId: "issuer-1", buyerAddress: buyerAddr,
     units: "10.000000", priceUsd: "10.000000", amountUsd: "100.000000",
+    offerChainId: null, offerCoinId: null, offerUnits: null, offerTxId: null,
+    sellerAddress: null,
   });
   await ms.setAttemptState(c2.attempt.id, "cash_moved");
   await reconcileSettlements();

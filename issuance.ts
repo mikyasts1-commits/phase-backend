@@ -84,6 +84,10 @@ export interface IssuanceCoin {
   supply: string;
   decimals: number;
   priceUsd: number; // issuer's starting price per whole coin, USD (trade price)
+  /** The issuer's sovereign wallet address (ph1...): the coin's retained
+   *  allocation and the swap-offer destination live here. Null for coins
+   *  minted before this column existed. */
+  issuerAddress: string | null;
   network: "sovereign";
   idempotencyKey: string;
   createdAt: string;
@@ -170,6 +174,8 @@ export interface IssuanceStore {
   getCoinByChainId(chainId: string): Promise<IssuanceCoin | null>;
   storeCoin(c: Omit<IssuanceCoin, "id" | "createdAt" | "network">): Promise<IssuanceCoin>;
   listCoinsByUser(userId: string): Promise<IssuanceCoin[]>;
+  /** Every issued coin, newest first — powers the public marketplace directory. */
+  listAllCoins(): Promise<IssuanceCoin[]>;
 }
 
 class PgIssuanceStore implements IssuanceStore {
@@ -284,12 +290,12 @@ class PgIssuanceStore implements IssuanceStore {
     const rows = await this.q<IssuanceCoin>(
       `INSERT INTO issuance_coins
          (id, draft_id, user_id, signature_id, is_meme, name, ticker,
-          mint_address, tx_signature, supply, decimals, price_usd, network, idempotency_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sovereign',$13)
+          mint_address, tx_signature, supply, decimals, price_usd, issuer_address, network, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'sovereign',$14)
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING ${COIN_COLS}`,
       [id, c.draftId, c.userId, c.signatureId, c.isMeme, c.name, c.ticker,
-       c.mintAddress, c.txSignature, c.supply, c.decimals, c.priceUsd, c.idempotencyKey]
+       c.mintAddress, c.txSignature, c.supply, c.decimals, c.priceUsd, c.issuerAddress ?? null, c.idempotencyKey]
     );
     // Lost the race: another request with the same key already stored a coin.
     const existing = await this.getCoinByIdempotency(c.idempotencyKey);
@@ -303,12 +309,19 @@ class PgIssuanceStore implements IssuanceStore {
       [userId]
     );
   }
+
+  async listAllCoins(): Promise<IssuanceCoin[]> {
+    return this.q<IssuanceCoin>(
+      `SELECT ${COIN_COLS} FROM issuance_coins ORDER BY created_at DESC`
+    );
+  }
 }
 
 const COIN_COLS = `id, draft_id AS "draftId", user_id AS "userId",
   signature_id AS "signatureId", is_meme AS "isMeme", name, ticker,
   mint_address AS "mintAddress", tx_signature AS "txSignature",
-  supply, decimals, price_usd AS "priceUsd", network, idempotency_key AS "idempotencyKey",
+  supply, decimals, price_usd AS "priceUsd", issuer_address AS "issuerAddress",
+  network, idempotency_key AS "idempotencyKey",
   created_at AS "createdAt"`;
 
 class MemoryIssuanceStore implements IssuanceStore {
@@ -367,6 +380,10 @@ class MemoryIssuanceStore implements IssuanceStore {
   }
   async listCoinsByUser(userId: string): Promise<IssuanceCoin[]> {
     return [...this.coins.values()].filter((c) => c.userId === userId)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  }
+  async listAllCoins(): Promise<IssuanceCoin[]> {
+    return [...this.coins.values()]
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   }
 }
@@ -708,6 +725,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         supply: String(totalShares),
         decimals: 6,
         priceUsd: draft.priceUsd,
+        issuerAddress,
         idempotencyKey: key,
       });
       await s.setDraftStatus(draftId, "minted");

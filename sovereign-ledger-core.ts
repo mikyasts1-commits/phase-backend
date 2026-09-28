@@ -1004,6 +1004,58 @@ function getChainBalance(chainId: string, address: string): string {
 }
 
 // ============================================================
+// Platform-operated transfer primitive (marketplace swap offer leg)
+// ============================================================
+// Move coins between two arbitrary ph1 addresses on the same chain as the
+// swap offer leg. The platform operator performs the move (no client-side
+// signing for arbitrary addresses exists on sovereign chains); the transfer
+// is recorded as a normal TRANSFER tx with an operatorSettled marker,
+// sequenced into blocks like any other transfer.
+// Internal use only: never exposed as a public HTTP route.
+async function settleOperatorTransfer(
+  chainId: string,
+  from: string,
+  to: string,
+  amountBaseUnits: string,
+  memo?: string
+): Promise<{ tx_id: string; status: string }> {
+  const chain = store.chains.get(chainId);
+  if (!chain) throw new LedgerError('chain_not_found', 'unknown chain', 404);
+  if (chain.status !== 'active') throw new LedgerError('chain_not_active', 'chain is not active', 409);
+  if (!isValidAddress(from)) throw new LedgerError('invalid_sender', 'sender address is invalid');
+  if (!isValidAddress(to)) throw new LedgerError('invalid_recipient', 'recipient address is invalid');
+  const amt = parseAmount(amountBaseUnits, 'amount');
+  return chainLock.withLock(chainId, async () => {
+    const fromEntry = store.getBalanceEntry(chainId, from);
+    if (fromEntry.balance < amt) {
+      throw new LedgerError('insufficient_balance', 'sender has insufficient balance for this transfer', 409);
+    }
+    const txId = 'tx_' + crypto.randomUUID();
+    const record: TxRecord = {
+      chainId,
+      txId,
+      type: 'TRANSFER',
+      sender: from,
+      nonce: computeExpectedNonce(chainId, from),
+      payload: { to, amount: amt.toString(), memo: memo ?? 'marketplace swap offer settlement' },
+      signatures: [],
+      submittedAt: Date.now(),
+      status: 'pending',
+      operatorSettled: true,
+    };
+    store.txById.set(txId, record);
+    const q = store.mempoolByChain.get(chainId) || [];
+    q.push(record);
+    store.mempoolByChain.set(chainId, q);
+    await persistTxRow(record);
+    await persistMempoolPut(record);
+    await auditLog('platform', 'operator_transfer_queued', 'tx', txId,
+      { chainId, from, to, amount: amt.toString() });
+    return { tx_id: txId, status: 'pending' };
+  });
+}
+
+// ============================================================
 // Sequencer — block production (spec Section 6.2 steps 4-5, 8.1)
 // ============================================================
 function produceBlockForChain(chainId: string): Promise<void> {
@@ -1381,6 +1433,7 @@ export {
   createChain,
   submitTransaction,
   settleFloatTransfer,
+  settleOperatorTransfer,
   getChainBalance,
   isValidAddress,
   PUBLIC_FLOAT_ADDRESS,
