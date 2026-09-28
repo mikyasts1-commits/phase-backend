@@ -24,11 +24,10 @@ import { getPool } from "./db.js";
 // ---------------------------------------------------------------------------
 
 const TEMPLATE_ONLY_NOTICE =
-  "TEMPLATE ONLY — NOT LEGAL ADVICE. This document is a template generated automatically " +
-  "from information the Issuer provided. It is for demonstration purposes, is not a binding " +
-  "legal agreement as generated, and is not a substitute for independent legal advice. Issuer " +
-  "and Phase should have legal counsel review and finalize this agreement before relying on " +
-  "it for any live offering.";
+  "NOT LEGAL ADVICE. This document was generated automatically " +
+  "from information the Issuer provided. It is not a substitute for independent legal " +
+  "advice. Issuer and Phase should have legal counsel review this agreement before " +
+  "relying on it for any live offering.";
 
 export interface IssuanceDraftInput {
   userId: string;
