@@ -62,6 +62,17 @@ export interface AuthStore {
   createSession(userId: string): Promise<{ token: string; expiresAt: string }>;
   getSession(token: string): Promise<{ userId: string; expiresAt: string } | null>;
   deleteSession(token: string): Promise<void>;
+  // Password reset
+  createPasswordResetToken(userId: string): Promise<string>;
+  validatePasswordResetToken(token: string): Promise<string | null>; // returns userId
+  usePasswordResetToken(token: string, newPasswordHash: string): Promise<boolean>;
+  // Email verification
+  createEmailVerificationToken(userId: string): Promise<string>;
+  verifyEmailToken(token: string): Promise<boolean>;
+  isEmailVerified(userId: string): Promise<boolean>;
+  // Login rate limiting
+  recordLoginAttempt(email: string, ip: string, success: boolean): Promise<void>;
+  countRecentFailedLogins(email: string, ip: string, sinceMinutes: number): Promise<number>;
 }
 
 class PgAuthStore implements AuthStore {
@@ -120,6 +131,82 @@ class PgAuthStore implements AuthStore {
   async deleteSession(token: string): Promise<void> {
     await this.q(`DELETE FROM auth_sessions WHERE token = $1`, [token]);
   }
+
+  async createPasswordResetToken(userId: string): Promise<string> {
+    const token = randomUUID() + randomUUID();
+    await this.q(
+      `INSERT INTO password_reset_tokens(token, user_id) VALUES ($1, $2)`,
+      [token, userId]
+    );
+    return token;
+  }
+
+  async validatePasswordResetToken(token: string): Promise<string | null> {
+    const rows = await this.q<{ userId: string }>(
+      `SELECT user_id AS "userId" FROM password_reset_tokens
+       WHERE token = $1 AND expires_at > now() AND used_at IS NULL`,
+      [token]
+    );
+    return rows[0]?.userId ?? null;
+  }
+
+  async usePasswordResetToken(token: string, newPasswordHash: string): Promise<boolean> {
+    const userId = await this.validatePasswordResetToken(token);
+    if (!userId) return false;
+    await this.q(`UPDATE issuance_users SET password_hash = $1 WHERE id = $2`, [newPasswordHash, userId]);
+    await this.q(`UPDATE password_reset_tokens SET used_at = now() WHERE token = $1`, [token]);
+    // Invalidate all sessions for security
+    await this.q(`DELETE FROM auth_sessions WHERE user_id = $1`, [userId]);
+    return true;
+  }
+
+  async createEmailVerificationToken(userId: string): Promise<string> {
+    const token = randomUUID() + randomUUID();
+    await this.q(
+      `INSERT INTO email_verification_tokens(token, user_id) VALUES ($1, $2)`,
+      [token, userId]
+    );
+    return token;
+  }
+
+  async verifyEmailToken(token: string): Promise<boolean> {
+    const rows = await this.q<{ userId: string }>(
+      `SELECT user_id AS "userId" FROM email_verification_tokens
+       WHERE token = $1 AND expires_at > now() AND used_at IS NULL`,
+      [token]
+    );
+    const userId = rows[0]?.userId;
+    if (!userId) return false;
+    await this.q(`UPDATE issuance_users SET email_verified = TRUE WHERE id = $1`, [userId]);
+    await this.q(`UPDATE email_verification_tokens SET used_at = now() WHERE token = $1`, [token]);
+    return true;
+  }
+
+  async isEmailVerified(userId: string): Promise<boolean> {
+    const rows = await this.q<{ emailVerified: boolean }>(
+      `SELECT email_verified AS "emailVerified" FROM issuance_users WHERE id = $1`,
+      [userId]
+    );
+    return rows[0]?.emailVerified ?? false;
+  }
+
+  async recordLoginAttempt(email: string, ip: string, success: boolean): Promise<void> {
+    await this.q(
+      `INSERT INTO login_attempts(email, ip, success) VALUES ($1, $2, $3)`,
+      [email, ip, success]
+    );
+  }
+
+  async countRecentFailedLogins(email: string, ip: string, sinceMinutes: number): Promise<number> {
+    const rows = await this.q<{ count: string }>(
+      `SELECT COUNT(*) as count FROM login_attempts
+       WHERE (lower(email) = lower($1) OR ip = $2)
+       AND success = FALSE
+       AND created_at > now() - ($3 || ' minutes')::INTERVAL`,
+      [email, ip, String(sinceMinutes)]
+    );
+    return parseInt(rows[0]?.count || "0", 10);
+  }
 }
 
 class MemoryAuthStore implements AuthStore {
@@ -163,6 +250,68 @@ class MemoryAuthStore implements AuthStore {
 
   async deleteSession(token: string) {
     this.sessions.delete(token);
+  }
+
+  private resetTokens = new Map<string, { userId: string; expiresAt: number; used: boolean }>();
+  private verifyTokens = new Map<string, { userId: string; expiresAt: number; used: boolean }>();
+  private verifiedEmails = new Set<string>();
+  private loginAttempts: Array<{ email: string; ip: string; success: boolean; at: number }> = [];
+
+  async createPasswordResetToken(userId: string): Promise<string> {
+    const token = randomUUID() + randomUUID();
+    this.resetTokens.set(token, { userId, expiresAt: Date.now() + 3600000, used: false });
+    return token;
+  }
+
+  async validatePasswordResetToken(token: string): Promise<string | null> {
+    const t = this.resetTokens.get(token);
+    if (!t || t.used || t.expiresAt <= Date.now()) return null;
+    return t.userId;
+  }
+
+  async usePasswordResetToken(token: string, newPasswordHash: string): Promise<boolean> {
+    const userId = await this.validatePasswordResetToken(token);
+    if (!userId) return false;
+    const acc = this.accounts.get(userId);
+    if (acc) acc.passwordHash = newPasswordHash;
+    this.resetTokens.get(token)!.used = true;
+    // Invalidate sessions
+    for (const [tok, s] of this.sessions) {
+      if (s.userId === userId) this.sessions.delete(tok);
+    }
+    return true;
+  }
+
+  async createEmailVerificationToken(userId: string): Promise<string> {
+    const token = randomUUID() + randomUUID();
+    this.verifyTokens.set(token, { userId, expiresAt: Date.now() + 86400000, used: false });
+    return token;
+  }
+
+  async verifyEmailToken(token: string): Promise<boolean> {
+    const t = this.verifyTokens.get(token);
+    if (!t || t.used || t.expiresAt <= Date.now()) return false;
+    this.verifiedEmails.add(t.userId);
+    t.used = true;
+    return true;
+  }
+
+  async isEmailVerified(userId: string): Promise<boolean> {
+    return this.verifiedEmails.has(userId);
+  }
+
+  async recordLoginAttempt(email: string, ip: string, success: boolean): Promise<void> {
+    this.loginAttempts.push({ email: email.toLowerCase(), ip, success, at: Date.now() });
+    // Keep only last 1000
+    if (this.loginAttempts.length > 1000) this.loginAttempts = this.loginAttempts.slice(-1000);
+  }
+
+  async countRecentFailedLogins(email: string, ip: string, sinceMinutes: number): Promise<number> {
+    const cutoff = Date.now() - sinceMinutes * 60000;
+    const e = email.toLowerCase();
+    return this.loginAttempts.filter(
+      (a) => !a.success && a.at > cutoff && (a.email === e || a.ip === ip)
+    ).length;
   }
 }
 
@@ -225,6 +374,14 @@ function bearerToken(ctx: AuthCtx): string | null {
   const h = Array.isArray(header) ? header[0] : header;
   if (!h || !h.startsWith("Bearer ")) return null;
   return h.slice("Bearer ".length).trim() || null;
+}
+
+function clientIp(ctx: AuthCtx): string {
+  const h = ctx.req.headers;
+  const fwd = h["x-forwarded-for"] ?? h["x-real-ip"];
+  const first = Array.isArray(fwd) ? fwd[0] : fwd;
+  if (typeof first === "string" && first) return first.split(",")[0].trim();
+  return "unknown";
 }
 
 // Shared session resolver for other route modules (issuance, marketplace).
@@ -299,7 +456,15 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
       }
 
       const session = await s.createSession(account.id);
-      sendJson(ctx.res, 201, { ...accountPayload(account), token: session.token, expiresAt: session.expiresAt });
+      // Generate email verification token (in production, this would be emailed)
+      const verificationToken = await s.createEmailVerificationToken(account.id);
+      sendJson(ctx.res, 201, {
+        ...accountPayload(account),
+        token: session.token,
+        expiresAt: session.expiresAt,
+        verificationToken,
+        emailVerified: false,
+      });
     } catch (err) { fail(ctx, err); }
   });
 
@@ -314,13 +479,22 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
       }
 
       const s = await store();
+      // Rate limiting: max 10 failed attempts per 15 min per email/IP.
+      const ip = clientIp(ctx);
+      const failedCount = await s.countRecentFailedLogins(email, ip, 15);
+      if (failedCount >= 10) {
+        throw new HttpError(429, "too_many_attempts", "Too many failed login attempts. Please wait 15 minutes and try again.");
+      }
+
       const account = await s.findByEmail(email);
       // Same generic error whether the email is unknown or the password is
       // wrong — don't reveal which one to an attacker.
       if (!account || !account.passwordHash || !verifyPassword(password, account.passwordHash)) {
+        await s.recordLoginAttempt(email, ip, false);
         throw new HttpError(401, "invalid_credentials", "No account found for that email and password.");
       }
 
+      await s.recordLoginAttempt(email, ip, true);
       const session = await s.createSession(account.id);
       sendJson(ctx.res, 200, { ...accountPayload(account), token: session.token, expiresAt: session.expiresAt });
     } catch (err) { fail(ctx, err); }
@@ -351,6 +525,74 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
         await s.deleteSession(token);
       }
       sendJson(ctx.res, 200, { ok: true });
+    } catch (err) { fail(ctx, err); }
+  });
+
+  // --- POST /api/v1/auth/forgot-password ---
+  // Generates a password reset token. In production this would be emailed;
+  // for now the token is returned so the app can display it (dev mode).
+  route("POST", "/api/v1/auth/forgot-password", async (ctx) => {
+    try {
+      const body = asRecord(ctx.body);
+      const email = str(body.email).trim().toLowerCase();
+      if (!EMAIL_RE.test(email)) {
+        throw new HttpError(422, "invalid_email", "Enter a valid email address.");
+      }
+      const s = await store();
+      const account = await s.findByEmail(email);
+      // Always return success to avoid revealing whether the email exists.
+      if (account && account.passwordHash) {
+        const token = await s.createPasswordResetToken(account.id);
+        sendJson(ctx.res, 200, { ok: true, resetToken: token, message: "If an account exists for this email, a reset token was generated." });
+      } else {
+        sendJson(ctx.res, 200, { ok: true, message: "If an account exists for this email, a reset token was generated." });
+      }
+    } catch (err) { fail(ctx, err); }
+  });
+
+  // --- POST /api/v1/auth/reset-password ---
+  route("POST", "/api/v1/auth/reset-password", async (ctx) => {
+    try {
+      const body = asRecord(ctx.body);
+      const token = str(body.token).trim();
+      const password = str(body.password);
+      if (!token) throw new HttpError(400, "missing_token", "Reset token is required.");
+      if (password.length < 8) {
+        throw new HttpError(422, "weak_password", "Password must be at least 8 characters.");
+      }
+      const s = await store();
+      const ok = await s.usePasswordResetToken(token, hashPassword(password));
+      if (!ok) throw new HttpError(400, "invalid_token", "Reset token is invalid or expired.");
+      sendJson(ctx.res, 200, { ok: true, message: "Password has been reset. Please log in with your new password." });
+    } catch (err) { fail(ctx, err); }
+  });
+
+  // --- POST /api/v1/auth/verify-email ---
+  route("POST", "/api/v1/auth/verify-email", async (ctx) => {
+    try {
+      const body = asRecord(ctx.body);
+      const token = str(body.token).trim();
+      if (!token) throw new HttpError(400, "missing_token", "Verification token is required.");
+      const s = await store();
+      const ok = await s.verifyEmailToken(token);
+      if (!ok) throw new HttpError(400, "invalid_token", "Verification token is invalid or expired.");
+      sendJson(ctx.res, 200, { ok: true, message: "Email verified successfully." });
+    } catch (err) { fail(ctx, err); }
+  });
+
+  // --- POST /api/v1/auth/resend-verification ---
+  // Requires auth — resends verification token for the logged-in user.
+  route("POST", "/api/v1/auth/resend-verification", async (ctx) => {
+    try {
+      const userId = await resolveBearerUserId(ctx.req.headers);
+      if (!userId) throw new HttpError(401, "unauthorized", "Sign in required.");
+      const s = await store();
+      if (await s.isEmailVerified(userId)) {
+        sendJson(ctx.res, 200, { ok: true, message: "Email is already verified." });
+        return;
+      }
+      const token = await s.createEmailVerificationToken(userId);
+      sendJson(ctx.res, 200, { ok: true, verificationToken: token });
     } catch (err) { fail(ctx, err); }
   });
 }
