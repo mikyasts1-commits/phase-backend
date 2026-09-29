@@ -59,6 +59,7 @@ import { mountFundingRoutes } from "./crypto-funding.js";
 import { mountBtcRoutes } from "./btc-funding.js";
 import { mountStripeRoutes } from "./stripe-funding.js";
 import { mountIssuanceRoutes } from "./issuance.js";
+import { mountAuthRoutes } from "./auth.js";
 import { mountSovereignLedgerRoutes } from "./sovereign-ledger.js";
 import { mountMarketplaceRoutes } from "./marketplace.js";
 import { mountLegalDocsRoutes } from "./legal-docs.js";
@@ -1113,6 +1114,12 @@ mountStripeRoutes({ route, sendJson, HttpError });
 // Same best-effort pattern: issuance falls back to an in-memory store when
 // Postgres is unavailable, so the server still boots.
 mountIssuanceRoutes({ route, sendJson, HttpError });
+
+// --- 8e-v(a). Real account auth (see auth.ts) ---
+// Email+password accounts with server-side sessions, on top of the existing
+// issuance_users table. Mounted right after issuance so /auth/* is live
+// alongside the issuance flow that depends on it.
+mountAuthRoutes({ route, sendJson, HttpError });
 
 // --- 8e-vi. Sovereign ledger (Phase 1 MVP; see sovereign-ledger.ts) ---
 // Per-user sovereign chains with Ed25519-signed transactions. Write-through
