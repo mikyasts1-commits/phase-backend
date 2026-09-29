@@ -34,6 +34,7 @@ import { getPool, migrate } from "./db.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolveBearerUserId } from "./auth.js";
+import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
 
 // ============================================================================
 // 1. ERRORS
@@ -933,6 +934,13 @@ function toHttpError(err: unknown, HttpError: SecuritiesMountDeps["HttpError"]):
 export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   const { route, sendJson, HttpError } = deps;
 
+  const ipOf = (ctx: RouteContextLike): string => clientIpFromHeaders(ctx.req.headers);
+  const limit = (key: string): void => {
+    if (!checkRateLimit(key, 30, 60_000)) {
+      throw new HttpError(429, "rate_limited", "Too many securities requests — wait a minute and try again.");
+    }
+  };
+
   const fail = (ctx: RouteContextLike, err: unknown): void => {
     const e = toHttpError(err, HttpError);
     const statusCode = (e as { statusCode?: number }).statusCode ?? 500;
@@ -945,6 +953,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   // --- GET /api/v1/securities/instruments?kind=&search=&symbol=&limit= ---
   route("GET", "/api/v1/securities/instruments", async (ctx) => {
     try {
+      limit(`securities:instruments:${ipOf(ctx)}`);
       const kind = ctx.query.get("kind");
       if (kind && !["stock", "etf", "bond", "treasury"].includes(kind)) {
         throw new SecuritiesHttpError(400, "bad_kind", "kind must be stock|etf|bond|treasury.");
@@ -964,6 +973,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   // --- GET /api/v1/securities/quote/:id ---
   route("GET", "/api/v1/securities/quote/:id", async (ctx) => {
     try {
+      limit(`securities:quote:${ipOf(ctx)}`);
       const quote = await getQuote(ctx.params.id);
       ok(ctx, 200, { quote });
     } catch (err) {
@@ -976,6 +986,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
     try {
       const body = asRecord(ctx.body);
       const userId = await requireUserId(ctx);
+      limit(`securities:orders-post:${userId}`);
       const { order, created } = await placeOrder({
         userId,
         instrumentId: String(body.instrumentId ?? ""),
@@ -995,6 +1006,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   route("DELETE", "/api/v1/securities/orders/:id", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`securities:orders-delete:${userId}`);
       const order = await cancelOrder(userId, ctx.params.id);
       ok(ctx, 200, { order });
     } catch (err) {
@@ -1006,6 +1018,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   route("GET", "/api/v1/securities/positions", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`securities:positions:${userId}`);
       const positions = await getPositions(userId);
       ok(ctx, 200, { userId, positions, count: positions.length });
     } catch (err) {
@@ -1017,6 +1030,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   route("GET", "/api/v1/securities/orders", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`securities:orders-get:${userId}`);
       const orders = await getOrders(userId, {
         status: ctx.query.get("status") ?? undefined,
         limit: ctx.query.get("limit") ? Number(ctx.query.get("limit")) : undefined,
@@ -1031,6 +1045,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   route("GET", "/api/v1/securities/transactions", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`securities:transactions:${userId}`);
       const transactions = await getTransactions(
         userId,
         ctx.query.get("limit") ? Number(ctx.query.get("limit")) : 50

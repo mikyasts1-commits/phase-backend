@@ -33,6 +33,7 @@ import {
 } from "./sovereign-ledger-core.js";
 import { getIssuanceStore, type IssuanceCoin } from "./issuance.js";
 import { resolveBearerUserId } from "./auth.js";
+import { checkRateLimit as sharedCheckRateLimit, clientIpFromHeaders } from "./rate-limit.js";
 
 // ---------------------------------------------------------------------------
 // Types + helpers
@@ -434,30 +435,14 @@ async function getStoreAsync(): Promise<MarketStore> {
 }
 
 // ---------------------------------------------------------------------------
-// Simple in-memory rate limiter (per route + client IP). Resets on restart;
-// sufficient for abuse-throttling test rails, not a DDoS control.
+// Rate limiting — shared helper (see rate-limit.ts). Kept re-exported here
+// for backward compatibility with the previous local definition.
 // ---------------------------------------------------------------------------
 
-const rateBuckets = new Map<string, { n: number; reset: number }>();
-
-export function checkRateLimit(key: string, max: number, windowMs: number): boolean {
-  const now = Date.now();
-  const b = rateBuckets.get(key);
-  if (!b || now > b.reset) {
-    rateBuckets.set(key, { n: 1, reset: now + windowMs });
-    return true;
-  }
-  b.n += 1;
-  return b.n <= max;
-}
+export const checkRateLimit = sharedCheckRateLimit;
 
 function clientIp(ctx: MarketplaceCtx): string {
-  const h = ctx.req.headers;
-  const fwd = h["x-forwarded-for"] ?? h["x-real-ip"];
-  const first = Array.isArray(fwd) ? fwd[0] : fwd;
-  if (typeof first === "string" && first) return first.split(",")[0].trim();
-  const sock = (ctx.req as unknown as { socket?: { remoteAddress?: string } }).socket;
-  return sock?.remoteAddress ?? "unknown";
+  return clientIpFromHeaders(ctx.req.headers);
 }
 
 // ---------------------------------------------------------------------------

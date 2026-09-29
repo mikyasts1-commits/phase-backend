@@ -96,6 +96,7 @@ import {
 import type { RouteContext, RouteHandler } from "./phase-backend.js";
 import { dbQuery, dbQueryOne } from "./db.js";
 import { resolveBearerUserId } from "./auth.js";
+import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
 
 // ============================================================================
 // 1. CONFIG & NETWORK SAFETY
@@ -1345,6 +1346,13 @@ function toHttpError(err: unknown, HttpError: FundingMountDeps["HttpError"]): Er
 export function mountFundingRoutes(deps: FundingMountDeps): void {
   const { route, sendJson, HttpError } = deps;
 
+  const ipOf = (ctx: RouteContext): string => clientIpFromHeaders(ctx.req.headers);
+  const limit = (key: string): void => {
+    if (!checkRateLimit(key, 20, 60_000)) {
+      throw new HttpError(429, "rate_limited", "Too many funding requests — wait a minute and try again.");
+    }
+  };
+
   const fail = (ctx: RouteContext, err: unknown): void => {
     const e = toHttpError(err, HttpError);
     const statusCode = (e as { statusCode?: number }).statusCode ?? 500;
@@ -1378,6 +1386,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   route("POST", "/api/v1/funding/wallets", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`funding:wallets:${userId}`);
       const { record, created } = await getOrCreateUserWallets(userId);
       sendJson(ctx.res, created ? 201 : 200, {
         ...networkEnvelope(),
@@ -1399,6 +1408,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   route("GET", "/api/v1/funding/deposit-address", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`funding:deposit-address-get:${userId}`);
       const defaultChain = resolveChain(ctx.query.get("chain")); // validate before any Circle call
       const currency = resolveCurrency(ctx.query.get("currency"), defaultChain);
       const { record } = await getOrCreateUserWallets(userId);
@@ -1438,6 +1448,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   route("GET", "/api/v1/funding/balances", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`funding:balances:${userId}`);
       const { record } = await getOrCreateUserWallets(userId);
 
       const chains = await Promise.all(
@@ -1493,6 +1504,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
     try {
       const body = asRecord(ctx.body);
       const userId = await requireUserId(ctx);
+      limit(`funding:transfer:${userId}`);
       const amount = body.amount;
       const chain = typeof body.chain === "string" ? body.chain : undefined;
       const currency = typeof body.currency === "string" ? body.currency : undefined;
@@ -1518,6 +1530,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   // --- POST /api/v1/funding/webhooks — Circle notifications ---
   route("POST", "/api/v1/funding/webhooks", async (ctx) => {
     try {
+      limit(`funding:webhook:${ipOf(ctx)}`);
       const rawBody: Buffer | undefined = (ctx as { rawBody?: Buffer }).rawBody;
       const parsed = (ctx.body ?? {}) as CircleWebhookPayload;
       const headers = (ctx.req.headers ?? {}) as Record<string, string | string[] | undefined>;
@@ -1530,6 +1543,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
 
   // Circle validates webhook endpoints with a HEAD request on subscribe.
   route("HEAD", "/api/v1/funding/webhooks", async (ctx) => {
+    limit(`funding:webhook-head:${ipOf(ctx)}`);
     sendJson(ctx.res, 200, { ...networkEnvelope(), ok: true });
   });
 
@@ -1537,6 +1551,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   route("GET", "/api/v1/funding/ledger", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`funding:ledger:${userId}`);
       const refresh = ctx.query.get("refresh") === "true";
       let entries = await dbListLedgerEntriesByUser(userId);
       if (refresh) {
@@ -1567,6 +1582,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
     try {
       const body = asRecord(ctx.body);
       const userId = await requireUserId(ctx);
+      limit(`funding:deposit-address-post:${userId}`);
       const chain = resolveChain(
         typeof body.chain === "string" && body.chain ? body.chain : null
       );
@@ -1603,6 +1619,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   route("GET", "/api/v1/funding/deposits", async (ctx) => {
     try {
       const userId = await requireUserId(ctx);
+      limit(`funding:deposits:${userId}`);
       const entries = (await dbListLedgerEntriesByUser(userId)).filter(
         (e) => e.kind === "deposit"
       );

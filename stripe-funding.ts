@@ -47,6 +47,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 import { dbQuery, dbQueryOne } from "./db.js";
 import { resolveBearerUserId } from "./auth.js";
+import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
 
 interface MountDeps {
   route: (method: string, path: string, handler: (ctx: RouteContext) => void | Promise<void>) => void;
@@ -254,8 +255,16 @@ function requireBodyObject(
 }
 
 export function mountStripeRoutes(deps: MountDeps): void {
+  const ipOf = (ctx: RouteContext): string => clientIpFromHeaders(ctx.req.headers);
+  const limit = (key: string): void => {
+    if (!checkRateLimit(key, 20, 60_000)) {
+      throw new deps.HttpError(429, "rate_limited", "Too many funding requests — wait a minute and try again.");
+    }
+  };
+
   // --- Status: configured? test mode? ---
   deps.route("GET", "/api/v1/stripe/status", (ctx) => {
+    limit(`stripe:status:${ipOf(ctx)}`);
     const key = process.env.STRIPE_SECRET_KEY?.trim();
     deps.sendJson(ctx.res, 200, {
       configured: !!getSecretKey(),
@@ -274,6 +283,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
     if (stripeError(deps, ctx)) return;
     const b = requireBodyObject(ctx.body, deps.HttpError);
     const userId = await requireUserId(ctx, deps.HttpError);
+    limit(`stripe:pi:create:${userId}`);
     const amount = Number(b.amount);
     const currency = String(b.currency ?? "cad").toLowerCase();
     if (!Number.isInteger(amount) || amount < 50) {
@@ -336,6 +346,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
   // --- Retrieve a PaymentIntent (poll for confirmation) ---
   deps.route("GET", "/api/v1/stripe/payment-intents/:id", async (ctx) => {
     if (stripeError(deps, ctx)) return;
+    limit(`stripe:pi:get:${ipOf(ctx)}`);
     const id = ctx.params.id;
     if (!/^pi_[A-Za-z0-9]+$/.test(id)) {
       throw new deps.HttpError(400, "bad_id", "Invalid PaymentIntent id");
@@ -358,6 +369,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
   // Idempotent: confirming an already-confirmed intent is a no-op.
   deps.route("POST", "/api/v1/stripe/payment-intents/:id/confirm", async (ctx) => {
     if (stripeError(deps, ctx)) return;
+    limit(`stripe:pi:confirm:${ipOf(ctx)}`);
     const id = ctx.params.id;
     if (!/^pi_[A-Za-z0-9]+$/.test(id)) {
       throw new deps.HttpError(400, "bad_id", "Invalid PaymentIntent id");
@@ -419,6 +431,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
   deps.route("GET", "/api/v1/stripe/balances", async (ctx) => {
     if (stripeError(deps, ctx)) return;
     const userId = await requireUserId(ctx, deps.HttpError);
+    limit(`stripe:balances:${userId}`);
     const rows = await dbQuery<{ currency: string; status: string; verified: boolean; total: string }>(
       `SELECT currency, status, verified, SUM(amount::numeric)::text AS total
        FROM ledger_entries
@@ -452,6 +465,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
   //   payment_intent.canceled       -> mark the ledger entry failed
   // Idempotent on the Stripe event id via webhook_dedup.
   deps.route("POST", "/api/v1/stripe/webhooks", async (ctx) => {
+    limit(`stripe:webhook:${ipOf(ctx)}`);
     const secret = getWebhookSecret();
     if (!secret) {
       deps.sendJson(ctx.res, 503, {

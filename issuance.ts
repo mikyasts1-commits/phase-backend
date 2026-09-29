@@ -15,6 +15,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createChain, LedgerError } from "./sovereign-ledger-core.js";
 import { getPool } from "./db.js";
 import { resolveBearerUserId } from "./auth.js";
+import { checkRateLimit } from "./rate-limit.js";
 
 // ---------------------------------------------------------------------------
 // Canonical issuer agreement text.
@@ -563,6 +564,9 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
     try {
       const body = asRecord(ctx.body);
       const userId = await requireUserId(ctx);
+      if (!checkRateLimit(`issuance:draft:${userId}`, 10, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many draft requests — wait a minute and try again.");
+      }
       const name = str(body.name).trim();
       if (name.length < 1 || name.length > 60) {
         throw new HttpError(422, "invalid_name", "name must be 1-60 characters");
@@ -629,6 +633,9 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
     try {
       const body = asRecord(ctx.body);
       const userId = await requireUserId(ctx);
+      if (!checkRateLimit(`issuance:sign:${userId}`, 10, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many sign requests — wait a minute and try again.");
+      }
       const draftId = str(body.draftId);
       if (!draftId) throw new HttpError(400, "missing_draft_id", "Body must include draftId.");
       const legalName = str(body.legalName).trim();
@@ -679,6 +686,9 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
     try {
       const body = asRecord(ctx.body);
       const userId = await requireUserId(ctx);
+      if (!checkRateLimit(`issuance:mint:${userId}`, 10, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many mint requests — wait a minute and try again.");
+      }
       const draftId = str(body.draftId);
       if (!draftId) throw new HttpError(400, "missing_draft_id", "Body must include draftId.");
       const isMeme = body.meme === true;
