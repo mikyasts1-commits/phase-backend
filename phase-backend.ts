@@ -1125,11 +1125,11 @@ mountAuthRoutes({ route, sendJson, HttpError });
 route("POST", "/api/v1/admin/wipe-users", async (ctx) => {
   const { dbQuery } = await import("./db.js");
   const users = await dbQuery("SELECT id, email FROM issuance_users");
-  await dbQuery("DELETE FROM issuance_users");
-  // Clear any orphaned demo data in non-cascading tables
-  await dbQuery("DELETE FROM ledger_entries").catch(() => {});
+  // Delete child tables first (foreign keys without CASCADE)
   await dbQuery("DELETE FROM market_trades").catch(() => {});
   await dbQuery("DELETE FROM market_balances").catch(() => {});
+  await dbQuery("DELETE FROM ledger_entries").catch(() => {});
+  await dbQuery("DELETE FROM issuance_users");
   sendJson(ctx.res, 200, { ok: true, wiped: users.map((u: any) => u.email) });
 });
 
