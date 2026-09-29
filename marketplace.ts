@@ -678,10 +678,16 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       const out = [];
       for (const c of coins) {
         let category: string | null = null;
+        let socialProfiles: Array<{ platform: string; url: string }> = [];
         try {
           const draft = c.draftId ? await issuance.getDraft(c.draftId) : null;
           const raw = draft?.category?.trim();
           category = raw ? raw : null;
+          if (draft?.socialProfiles) {
+            socialProfiles = Array.isArray(draft.socialProfiles)
+              ? draft.socialProfiles
+              : JSON.parse(draft.socialProfiles as unknown as string);
+          }
         } catch { category = null; }
         let floatAvailable = "0";
         try {
@@ -699,6 +705,8 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
           hasAgreement: c.signatureId != null,
           issuerUserId: c.userId,
           issuerAddress: c.issuerAddress ?? null,
+          socialProfiles,
+          websiteUrl: c.websiteUrl ?? null,
           createdAt: c.createdAt,
           floatAvailable,
           online: true,
