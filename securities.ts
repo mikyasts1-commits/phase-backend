@@ -35,6 +35,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolveBearerUserId } from "./auth.js";
 import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
+import { auditLog } from "./sovereign-ledger-core.js";
 
 // ============================================================================
 // 1. ERRORS
@@ -236,6 +237,7 @@ export class SandboxSecuritiesProvider implements SecuritiesProvider {
   readonly name = "sandbox";
   private rngs = new Map<string, () => number>();
   private orders = new Map<string, ProviderOrder & { limitPrice: number | null; orderType: OrderType }>();
+  private ordersByIdempotency = new Map<string, ProviderOrder & { limitPrice: number | null; orderType: OrderType }>();
   private actions: CorporateAction[] = [];
 
   private rngFor(id: string): () => number {
@@ -344,6 +346,15 @@ export class SandboxSecuritiesProvider implements SecuritiesProvider {
   }
 
   async placeOrder(input: PlaceOrderInput): Promise<ProviderOrder> {
+    // Idempotency: same key -> return the original order, never a duplicate.
+    const key = (input.idempotencyKey ?? "").trim();
+    if (key) {
+      const prior = this.ordersByIdempotency.get(key);
+      if (prior) {
+        const { limitPrice: _lp, orderType: _ot, ...pub } = prior;
+        return pub;
+      }
+    }
     const q = await this.getQuote(input.instrumentId); // validates instrument
     const providerOrderId = "sb-" + randomUUID();
     const o: ProviderOrder & { limitPrice: number | null; orderType: OrderType } = {
@@ -359,6 +370,7 @@ export class SandboxSecuritiesProvider implements SecuritiesProvider {
       orderType: input.orderType,
     };
     this.orders.set(providerOrderId, o);
+    if (key) this.ordersByIdempotency.set(key, o);
     this.tryFill(o, q);
     const { limitPrice: _lp, orderType: _ot, ...pub } = o;
     return pub;
@@ -996,6 +1008,10 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
         limitPrice: body.limitPrice == null ? undefined : Number(body.limitPrice),
         idempotencyKey: String(body.idempotencyKey ?? ""),
       });
+      if (created) {
+        await auditLog(userId, "securities_order_placed", "securities_order", order.id,
+          { instrumentId: order.instrumentId, side: order.side, qty: order.qty, status: order.status });
+      }
       ok(ctx, created ? 201 : 200, { order, created });
     } catch (err) {
       fail(ctx, err);
@@ -1008,6 +1024,8 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
       const userId = await requireUserId(ctx);
       limit(`securities:orders-delete:${userId}`);
       const order = await cancelOrder(userId, ctx.params.id);
+      await auditLog(userId, "securities_order_cancelled", "securities_order", order.id,
+        { instrumentId: order.instrumentId });
       ok(ctx, 200, { order });
     } catch (err) {
       fail(ctx, err);

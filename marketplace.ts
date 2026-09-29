@@ -11,9 +11,6 @@
  *   POST /api/v1/trades/buy       execute a buy (idempotent)
  *   GET  /api/v1/trades/balances   per-user cash balances + lifetime sales
  *   GET  /api/v1/trades/history     trades where the user was buyer/seller
- *   POST /api/v1/trades/topup      TEST-MODE faucet: credit USD for trying
- *                                       the flow. Test rails only — never wire
- *                                       this to real money.
  *
  * Persistence: Postgres when DATABASE_URL is set, otherwise a small in-memory
  * store (dev/test). The interface is identical in both modes.
@@ -199,7 +196,7 @@ class PgMarketStore implements MarketStore {
       );
       if (debit.rowCount === 0) {
         throw new MarketplaceHttpError(402, "insufficient_funds",
-          "Not enough USD in your cash account. Add test funds and try again.");
+          "Not enough USD in your cash account. Insufficient balance. Add funds to continue.");
       }
       await client.query(
         `INSERT INTO market_balances (user_id, currency, balance)
@@ -350,7 +347,7 @@ class MemoryMarketStore implements MarketStore {
     const amt = Number(amount);
     if (this.bal(from, currency) < amt) {
       throw new MarketplaceHttpError(402, "insufficient_funds",
-        "Not enough USD in your cash account. Add test funds and try again.");
+        "Not enough USD in your cash account. Insufficient balance. Add funds to continue.");
     }
     this.setBal(from, currency, this.bal(from, currency) - amt);
     this.setBal(to, currency, this.bal(to, currency) + amt);
@@ -953,28 +950,6 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
     } catch (err) { fail(ctx, err); }
   });
 
-  // --- POST /api/v1/trades/topup ---
-  // TEST-MODE faucet: credit USD so the buy flow can be tried end to end.
-  // Test rails only. Never wire to real money.
-  route("POST", "/api/v1/trades/topup", async (ctx) => {
-    try {
-      if (!checkRateLimit(`topup:${clientIp(ctx)}`, 10, 60_000)) {
-        throw new HttpError(429, "rate_limited", "Too many top-up requests — wait a minute and try again.");
-      }
-      const body = asRecord(ctx.body);
-      const userId = await requireUserId(ctx);
-      const amountUsd = parsePositiveMoney(body.amountUsd, "amountUsd", 100_000);
-      const ms = await getStoreAsync();
-      await ms.credit(userId, USD, money6(amountUsd));
-      const balance = await ms.getBalance(userId, USD);
-      sendJson(ctx.res, 200, {
-        ...NETWORK_ENVELOPE,
-        testMode: true,
-        creditedUsd: money6(amountUsd),
-        balanceUsd: balance,
-      });
-    } catch (err) { fail(ctx, err); }
-  });
 }
 
 // ---------------------------------------------------------------------------

@@ -48,6 +48,7 @@ import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 import { dbQuery, dbQueryOne } from "./db.js";
 import { resolveBearerUserId } from "./auth.js";
 import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
+import { auditLog } from "./sovereign-ledger-core.js";
 
 interface MountDeps {
   route: (method: string, path: string, handler: (ctx: RouteContext) => void | Promise<void>) => void;
@@ -90,6 +91,7 @@ async function stripeApi(
   method: string,
   path: string,
   params?: Record<string, string>,
+  idempotencyKey?: string,
 ): Promise<{ status: number; data: unknown }> {
   const key = getSecretKey();
   if (!key) throw new Error("stripe_not_configured");
@@ -97,6 +99,7 @@ async function stripeApi(
     Authorization: `Bearer ${key}`,
     "Stripe-Version": "2025-08-27.basil",
   };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   let url = STRIPE_API + path;
   let body: string | undefined;
   if (method === "GET" && params) {
@@ -292,12 +295,17 @@ export function mountStripeRoutes(deps: MountDeps): void {
     if (!/^[a-z]{3}$/.test(currency)) {
       throw new deps.HttpError(400, "bad_currency", "`currency` must be a 3-letter ISO code");
     }
+    const idemHeader = ctx.req.headers["idempotency-key"] ?? ctx.req.headers["x-idempotency-key"];
+    const idemKey = (Array.isArray(idemHeader) ? idemHeader[0] : idemHeader)?.trim()
+      || (typeof b.idempotencyKey === "string" && b.idempotencyKey.trim())
+      || randomUUID();
     const params: Record<string, string> = {
       amount: String(amount),
       currency,
       "automatic_payment_methods[enabled]": "true",
       "automatic_payment_methods[allow_redirects]": "never",
     };
+    params["metadata[phase_idempotency_key]"] = idemKey;
     if (b.description) params.description = String(b.description).slice(0, 200);
     params["metadata[phase_user_id]"] = userId;
     if (b.metadata && typeof b.metadata === "object") {
@@ -305,7 +313,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
         params[`metadata[${k}]`] = String(v).slice(0, 200);
       }
     }
-    const { status, data } = await stripeApi("POST", "/v1/payment_intents", params);
+    const { status, data } = await stripeApi("POST", "/v1/payment_intents", params, idemKey);
     const d = data as Record<string, unknown>;
     let ledger: FiatLedgerEntry | null = null;
     let ledgerCreated = false;
@@ -324,6 +332,10 @@ export function mountStripeRoutes(deps: MountDeps): void {
         // The PaymentIntent exists at Stripe; confirm will retry the insert.
         console.warn(`[stripe] ledger insert failed for ${d.id}: ${err instanceof Error ? err.message : String(err)}`);
       }
+    }
+    if (status < 400 && typeof d.id === "string") {
+      await auditLog(userId, "stripe_pi_created", "stripe_payment_intent", d.id,
+        { amountMinor: amount, currency, ledgerCreated });
     }
     deps.sendJson(ctx.res, status, {
       testmode: true,
@@ -405,6 +417,10 @@ export function mountStripeRoutes(deps: MountDeps): void {
         ledger = r.entry;
       }
       ledger = await confirmFiatLedgerEntry(id);
+      if (ledger) {
+        await auditLog(ledger.user_id ?? metaUser ?? "unknown", "stripe_pi_confirmed",
+          "stripe_payment_intent", id, { ledgerId: ledger.id, status: ledger.status });
+      }
     } else {
       ledger = await dbQueryOne<FiatLedgerEntry>(
         `SELECT id, user_id, amount, currency, stripe_payment_intent_id, status, verified
@@ -526,6 +542,8 @@ export function mountStripeRoutes(deps: MountDeps): void {
         action = "marked_failed";
       }
     }
+    await auditLog("stripe", "stripe_webhook", "stripe_event", eventId ?? undefined,
+      { eventType, action, paymentIntentId: piId, ledgerId: ledger?.id ?? null });
     deps.sendJson(ctx.res, 200, {
       testmode: true,
       livemode: false,

@@ -97,6 +97,7 @@ import type { RouteContext, RouteHandler } from "./phase-backend.js";
 import { dbQuery, dbQueryOne } from "./db.js";
 import { resolveBearerUserId } from "./auth.js";
 import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
+import { auditLog } from "./sovereign-ledger-core.js";
 
 // ============================================================================
 // 1. CONFIG & NETWORK SAFETY
@@ -1229,6 +1230,8 @@ export async function handleCircleWebhook(
         });
         action = "sweep_status_updated";
       }
+      await auditLog(entry.userId, "funding_sweep_outcome", "funding_ledger_entry", entry.id,
+        { action, circleTransferId: circleTxId, txHash: n.txHash ?? null });
     }
   }
 
@@ -1297,6 +1300,8 @@ export async function handleCircleWebhook(
         });
       }
       action = confirmed ? "deposit_confirmed" : "deposit_confirming";
+      await auditLog(rec.userId, "funding_deposit_detected", "funding_ledger_entry", undefined,
+        { chain: wallet.blockchain, amount, currency, confirmed, txHash: n.txHash ?? null });
       break;
     }
   }
@@ -1388,6 +1393,10 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
       const userId = await requireUserId(ctx);
       limit(`funding:wallets:${userId}`);
       const { record, created } = await getOrCreateUserWallets(userId);
+      if (created) {
+        await auditLog(userId, "funding_wallets_created", "funding_wallet_set", record.walletSetId,
+          { chains: record.wallets.map((w) => w.blockchain) });
+      }
       sendJson(ctx.res, created ? 201 : 200, {
         ...networkEnvelope(),
         userId,
@@ -1516,6 +1525,9 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
         currency,
         idempotencyKey,
       });
+      await auditLog(userId, created ? "funding_sweep_created" : "funding_sweep_replayed",
+        "funding_ledger_entry", entry.id,
+        { chain: entry.chain, amount: entry.amount, currency: entry.currency, status: entry.status });
       sendJson(ctx.res, created ? 201 : 200, {
         ...networkEnvelope(),
         created,

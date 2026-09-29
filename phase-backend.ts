@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- *  PHASE PROTOCOL — Mock Backend & Simulated Ledger Engine
+ *  PHASE PROTOCOL — Backend & Ledger Engine
  * ============================================================================
  *
  *  A single-file, zero-dependency TypeScript/Node backend that simulates a

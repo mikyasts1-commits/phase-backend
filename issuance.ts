@@ -12,6 +12,7 @@
  * Mounted from phase-backend.ts: mountIssuanceRoutes({ route, sendJson, HttpError })
  */
 import { createHash, randomUUID } from "node:crypto";
+import { auditLog } from "./sovereign-ledger-core.js";
 import { createChain, LedgerError } from "./sovereign-ledger-core.js";
 import { getPool } from "./db.js";
 import { resolveBearerUserId } from "./auth.js";
@@ -58,6 +59,8 @@ export interface IssuanceDraft extends Required<Omit<IssuanceDraftInput, "catego
   status: "draft" | "signed" | "minted";
   createdAt: string;
   updatedAt: string;
+  /** Optional client-supplied idempotency key — replays return the original draft. */
+  idempotencyKey?: string | null;
 }
 
 export interface IssuanceSignature {
@@ -72,6 +75,8 @@ export interface IssuanceSignature {
   issuerCategory: string;
   /** Entity signers only: office/title held. */
   title: string | null;
+  /** Optional client-supplied idempotency key — replays return the original signature. */
+  idempotencyKey?: string | null;
 }
 
 export interface IssuanceCoin {
@@ -176,10 +181,12 @@ export interface IssuanceStore {
   ensureUser(userId: string, email?: string): Promise<void>;
   createDraft(d: Omit<IssuanceDraft, "id" | "status" | "createdAt" | "updatedAt">): Promise<IssuanceDraft>;
   getDraft(id: string): Promise<IssuanceDraft | null>;
+  getDraftByIdempotency(key: string): Promise<IssuanceDraft | null>;
   setDraftStatus(id: string, status: IssuanceDraft["status"]): Promise<void>;
   storeSignature(s: Omit<IssuanceSignature, "id" | "signedAt">): Promise<IssuanceSignature>;
   getSignatureByDraft(draftId: string): Promise<IssuanceSignature | null>;
   getSignatureById(id: string): Promise<IssuanceSignature | null>;
+  getSignatureByIdempotency(key: string): Promise<IssuanceSignature | null>;
   getCoinByIdempotency(key: string): Promise<IssuanceCoin | null>;
   getCoinByDraft(draftId: string): Promise<IssuanceCoin | null>;
   getCoinByChainId(chainId: string): Promise<IssuanceCoin | null>;
@@ -208,18 +215,19 @@ class PgIssuanceStore implements IssuanceStore {
     const rows = await this.q<IssuanceDraft>(
       `INSERT INTO issuance_drafts
          (id, user_id, name, ticker, category, tagline, value_thesis, equity_public,
-          equity_retained, social_profiles, website_url, price_usd, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'draft')
+          equity_retained, social_profiles, website_url, price_usd, status, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'draft',$13)
        RETURNING id, user_id AS "userId", name, ticker, category, tagline,
                  value_thesis AS "valueThesis", equity_public AS "equityPublic",
                  equity_retained AS "equityRetained",
                  social_profiles AS "socialProfiles", website_url AS "websiteUrl",
                  price_usd AS "priceUsd",
                  status,
-                 created_at AS "createdAt", updated_at AS "updatedAt"`,
+                 created_at AS "createdAt", updated_at AS "updatedAt",
+                 idempotency_key AS "idempotencyKey"`,
       [id, d.userId, d.name, d.ticker, d.category, d.tagline, d.valueThesis,
        d.equityPublic, d.equityRetained, JSON.stringify(d.socialProfiles),
-       d.websiteUrl ?? null, d.priceUsd]
+       d.websiteUrl ?? null, d.priceUsd, d.idempotencyKey ?? null]
     );
     return rows[0]!;
   }
@@ -232,9 +240,26 @@ class PgIssuanceStore implements IssuanceStore {
               social_profiles AS "socialProfiles", website_url AS "websiteUrl",
               price_usd AS "priceUsd",
               status,
-              created_at AS "createdAt", updated_at AS "updatedAt"
+              created_at AS "createdAt", updated_at AS "updatedAt",
+              idempotency_key AS "idempotencyKey"
        FROM issuance_drafts WHERE id = $1`,
       [id]
+    );
+    return rows[0] ?? null;
+  }
+
+  async getDraftByIdempotency(key: string): Promise<IssuanceDraft | null> {
+    const rows = await this.q<IssuanceDraft>(
+      `SELECT id, user_id AS "userId", name, ticker, category, tagline,
+              value_thesis AS "valueThesis", equity_public AS "equityPublic",
+              equity_retained AS "equityRetained",
+              social_profiles AS "socialProfiles", website_url AS "websiteUrl",
+              price_usd AS "priceUsd",
+              status,
+              created_at AS "createdAt", updated_at AS "updatedAt",
+              idempotency_key AS "idempotencyKey"
+       FROM issuance_drafts WHERE idempotency_key = $1`,
+      [key]
     );
     return rows[0] ?? null;
   }
@@ -248,14 +273,15 @@ class PgIssuanceStore implements IssuanceStore {
     const rows = await this.q<IssuanceSignature>(
       `INSERT INTO issuance_signatures
          (id, draft_id, user_id, legal_name, agreement_hash, agreement_text,
-          issuer_category, title)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          issuer_category, title, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING id, draft_id AS "draftId", user_id AS "userId",
                  legal_name AS "legalName", agreement_hash AS "agreementHash",
                  agreement_text AS "agreementText", signed_at AS "signedAt",
-                 issuer_category AS "issuerCategory", title`,
+                 issuer_category AS "issuerCategory", title,
+                 idempotency_key AS "idempotencyKey"`,
       [id, s.draftId, s.userId, s.legalName, s.agreementHash, s.agreementText,
-       s.issuerCategory ?? "individual", s.title ?? null]
+       s.issuerCategory ?? "individual", s.title ?? null, s.idempotencyKey ?? null]
     );
     return rows[0]!;
   }
@@ -280,6 +306,19 @@ class PgIssuanceStore implements IssuanceStore {
               issuer_category AS "issuerCategory", title
        FROM issuance_signatures WHERE id = $1`,
       [id]
+    );
+    return rows[0] ?? null;
+  }
+
+  async getSignatureByIdempotency(key: string): Promise<IssuanceSignature | null> {
+    const rows = await this.q<IssuanceSignature>(
+      `SELECT id, draft_id AS "draftId", user_id AS "userId",
+              legal_name AS "legalName", agreement_hash AS "agreementHash",
+              agreement_text AS "agreementText", signed_at AS "signedAt",
+              issuer_category AS "issuerCategory", title,
+              idempotency_key AS "idempotencyKey"
+       FROM issuance_signatures WHERE idempotency_key = $1`,
+      [key]
     );
     return rows[0] ?? null;
   }
@@ -345,7 +384,9 @@ const COIN_COLS = `id, draft_id AS "draftId", user_id AS "userId",
 class MemoryIssuanceStore implements IssuanceStore {
   private users = new Map<string, { email?: string }>();
   private drafts = new Map<string, IssuanceDraft>();
+  private draftsByKey = new Map<string, IssuanceDraft>();
   private sigsByDraft = new Map<string, IssuanceSignature>();
+  private sigsByKey = new Map<string, IssuanceSignature>();
   private coins = new Map<string, IssuanceCoin>();
   private coinsByKey = new Map<string, IssuanceCoin>();
 
@@ -356,10 +397,14 @@ class MemoryIssuanceStore implements IssuanceStore {
     const now = new Date().toISOString();
     const draft: IssuanceDraft = { ...d, id: randomUUID(), status: "draft", createdAt: now, updatedAt: now };
     this.drafts.set(draft.id, draft);
+    if (draft.idempotencyKey) this.draftsByKey.set(draft.idempotencyKey, draft);
     return draft;
   }
   async getDraft(id: string): Promise<IssuanceDraft | null> {
     return this.drafts.get(id) ?? null;
+  }
+  async getDraftByIdempotency(key: string): Promise<IssuanceDraft | null> {
+    return this.draftsByKey.get(key) ?? null;
   }
   async setDraftStatus(id: string, status: IssuanceDraft["status"]): Promise<void> {
     const d = this.drafts.get(id);
@@ -368,6 +413,7 @@ class MemoryIssuanceStore implements IssuanceStore {
   async storeSignature(s: Omit<IssuanceSignature, "id" | "signedAt">): Promise<IssuanceSignature> {
     const sig: IssuanceSignature = { ...s, id: randomUUID(), signedAt: new Date().toISOString() };
     this.sigsByDraft.set(s.draftId, sig);
+    if (sig.idempotencyKey) this.sigsByKey.set(sig.idempotencyKey, sig);
     return sig;
   }
   async getSignatureByDraft(draftId: string): Promise<IssuanceSignature | null> {
@@ -376,6 +422,9 @@ class MemoryIssuanceStore implements IssuanceStore {
   async getSignatureById(id: string): Promise<IssuanceSignature | null> {
     for (const s of this.sigsByDraft.values()) if (s.id === id) return s;
     return null;
+  }
+  async getSignatureByIdempotency(key: string): Promise<IssuanceSignature | null> {
+    return this.sigsByKey.get(key) ?? null;
   }
   async getCoinByIdempotency(key: string): Promise<IssuanceCoin | null> {
     return this.coinsByKey.get(key) ?? null;
@@ -547,6 +596,14 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
     return authed;
   };
 
+  /** Optional idempotency key for draft/sign: header or body, null when absent. */
+  const idemKeyOf = (ctx: IssuanceCtx, body: Record<string, unknown>): string | null => {
+    const header = ctx.req.headers["idempotency-key"] ?? ctx.req.headers["x-idempotency-key"];
+    const h = Array.isArray(header) ? header[0] : header;
+    const key = (typeof h === "string" && h.trim()) || str(body.idempotencyKey).trim();
+    return key || null;
+  };
+
   const idempotencyKey = (ctx: IssuanceCtx): string => {
     const header = ctx.req.headers["idempotency-key"] ?? ctx.req.headers["x-idempotency-key"];
     const h = Array.isArray(header) ? header[0] : header;
@@ -566,6 +623,16 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
       const userId = await requireUserId(ctx);
       if (!checkRateLimit(`issuance:draft:${userId}`, 10, 60_000)) {
         throw new HttpError(429, "rate_limited", "Too many draft requests — wait a minute and try again.");
+      }
+      const draftIdemKey = idemKeyOf(ctx, body);
+      const s = await store();
+      if (draftIdemKey) {
+        const replay = await s.getDraftByIdempotency(draftIdemKey);
+        if (replay) {
+          if (replay.userId !== userId) throw new HttpError(403, "forbidden", "This idempotency key belongs to a different user.");
+          sendJson(ctx.res, 200, { ...NETWORK_ENVELOPE, draftId: replay.id, status: replay.status, draft: replay, idempotentReplay: true });
+          return;
+        }
       }
       const name = str(body.name).trim();
       if (name.length < 1 || name.length > 60) {
@@ -590,7 +657,6 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         throw new HttpError(422, "invalid_price", "priceUsd must be a positive number.");
       }
 
-      const s = await store();
       await s.ensureUser(userId, str(body.email) || undefined);
       const draft = await s.createDraft({
         userId,
@@ -604,7 +670,10 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         socialProfiles,
         websiteUrl: str(body.websiteUrl ?? body.website_url).trim().slice(0, 500) || null,
         priceUsd,
+        idempotencyKey: draftIdemKey,
       });
+      await auditLog(userId, "issuance_draft_created", "issuance_draft", draft.id,
+        { ticker: draft.ticker, name: draft.name });
       sendJson(ctx.res, 201, { ...NETWORK_ENVELOPE, draftId: draft.id, status: draft.status, draft });
     } catch (err) { fail(ctx, err); }
   });
@@ -638,6 +707,26 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
       }
       const draftId = str(body.draftId);
       if (!draftId) throw new HttpError(400, "missing_draft_id", "Body must include draftId.");
+      const signIdemKey = idemKeyOf(ctx, body);
+      const s = await store();
+      if (signIdemKey) {
+        const replaySig = await s.getSignatureByIdempotency(signIdemKey);
+        if (replaySig) {
+          if (replaySig.userId !== userId) throw new HttpError(403, "forbidden", "This idempotency key belongs to a different user.");
+          sendJson(ctx.res, 200, {
+            ...NETWORK_ENVELOPE,
+            signatureId: replaySig.id,
+            draftId: replaySig.draftId,
+            legalName: replaySig.legalName,
+            agreementHash: replaySig.agreementHash,
+            signedAt: replaySig.signedAt,
+            issuerCategory: replaySig.issuerCategory,
+            title: replaySig.title,
+            idempotentReplay: true,
+          });
+          return;
+        }
+      }
       const legalName = str(body.legalName).trim();
       if (legalName.length < 2) {
         throw new HttpError(422, "invalid_legal_name", "legalName is required: type your full legal name to sign.");
@@ -650,7 +739,6 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         throw new HttpError(422, "invalid_issuer_category", "issuerCategory must be 'individual' or 'entity'.");
       }
       const title = str(body.title).trim().slice(0, 120) || null;
-      const s = await store();
       const draft = await s.getDraft(draftId);
       if (!draft) throw new HttpError(404, "draft_not_found", "No draft with that id.");
       if (draft.userId !== userId) throw new HttpError(403, "forbidden", "This draft belongs to a different user.");
@@ -666,8 +754,11 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         agreementText,
         issuerCategory,
         title,
+        idempotencyKey: signIdemKey,
       });
       await s.setDraftStatus(draftId, "signed");
+      await auditLog(userId, "issuance_agreement_signed", "issuance_signature", sig.id,
+        { draftId, agreementHash: sig.agreementHash });
       sendJson(ctx.res, 201, {
         ...NETWORK_ENVELOPE,
         signatureId: sig.id,
@@ -768,6 +859,8 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         idempotencyKey: key,
       });
       await s.setDraftStatus(draftId, "minted");
+      await auditLog(userId, "issuance_coin_minted", "issuance_coin", coin.id,
+        { draftId, ticker: coin.ticker, chainId: coin.mintAddress, supply: coin.supply });
 
       sendJson(ctx.res, 201, {
         ...NETWORK_ENVELOPE,

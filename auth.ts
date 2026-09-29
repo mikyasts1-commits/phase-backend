@@ -22,7 +22,7 @@
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { getPool } from "./db.js";
 import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
-import { auditLog } from "./audit.js";
+import { auditLog } from "./sovereign-ledger-core.js";
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const SCRYPT_KEYLEN = 64;
@@ -635,7 +635,7 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
         throw new HttpError(403, "invalid_password", "Password is incorrect.");
       }
       await s.deleteAccount(userId);
-      auditLog("auth.account_deleted", { userId });
+      await auditLog(userId, "account_deleted", "issuance_users", userId, {});
       sendJson(ctx.res, 200, { ok: true });
     } catch (err) { fail(ctx, err); }
   });
@@ -661,6 +661,7 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
         const token = await s.createPasswordResetToken(account.id);
         // TODO: send via email; for now only logged server-side, NEVER returned.
         console.log(`[auth] password reset token for ${account.id}: ${token} (TODO: email this)`);
+        await auditLog(account.id, "password_reset_requested", "issuance_users", account.id, {});
         sendJson(ctx.res, 200, { ok: true, message: "If an account exists for this email, a reset token was generated." });
       } else {
         sendJson(ctx.res, 200, { ok: true, message: "If an account exists for this email, a reset token was generated." });
@@ -697,8 +698,9 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
       const token = str(body.token).trim();
       if (!token) throw new HttpError(400, "missing_token", "Verification token is required.");
       const s = await store();
-      const ok = await s.verifyEmailToken(token);
-      if (!ok) throw new HttpError(400, "invalid_token", "Verification token is invalid or expired.");
+      const verifiedUserId = await s.verifyEmailToken(token);
+      if (!verifiedUserId) throw new HttpError(400, "invalid_token", "Verification token is invalid or expired.");
+      await auditLog(verifiedUserId, "email_verified", "issuance_users", verifiedUserId, {});
       sendJson(ctx.res, 200, { ok: true, message: "Email verified successfully." });
     } catch (err) { fail(ctx, err); }
   });
