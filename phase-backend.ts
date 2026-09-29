@@ -1139,8 +1139,12 @@ import("./fee.js").then(async (fee) => {
   try {
     await fee.assertProductionReady();
   } catch (e) {
-    console.error("[boot] production preflight failed:", (e as Error).message);
-    throw e;
+    // Production preflight failed with PHASE_REQUIRE_PRODUCTION_CHECKS=true.
+    // This must block boot — exit rather than serving traffic in a state
+    // the checks declared unsafe. (Without the flag, assertProductionReady
+    // never throws, so dev/test boot is unaffected.)
+    console.error("[boot] FATAL: production preflight failed:", (e as Error).message);
+    process.exit(1);
   }
   const runDaily = async () => {
     try {
