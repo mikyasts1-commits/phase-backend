@@ -67,10 +67,30 @@ interface RouteContext {
 
 const STRIPE_API = "https://api.stripe.com";
 
+/** True when running as the production deployment. */
+function isProduction(): boolean {
+  return (process.env.PHASE_ENV ?? process.env.NODE_ENV ?? "").toLowerCase() === "production";
+}
+
+/** Response flags describing whether the configured Stripe key is a live key. */
+function stripeModeFlags(): { testmode: boolean; livemode: boolean } {
+  const live = (process.env.STRIPE_SECRET_KEY ?? "").trim().startsWith("sk_live_");
+  return { testmode: !live, livemode: live };
+}
+
 function getSecretKey(): string | null {
   const key = process.env.STRIPE_SECRET_KEY?.trim();
   if (!key) return null;
-  if (!key.startsWith("sk_test_")) return null; // live keys refused, no override
+  // Strict environment separation: production accepts ONLY live keys
+  // (sk_live_*); every other environment accepts ONLY test keys (sk_test_*).
+  // A test key in production (or a live key in dev) is refused outright so
+  // real cards can never be charged from a non-production build and test
+  // traffic can never silently run as production.
+  if (isProduction()) {
+    if (!key.startsWith("sk_live_")) return null;
+  } else {
+    if (!key.startsWith("sk_test_")) return null;
+  }
   return key;
 }
 
@@ -78,11 +98,13 @@ function stripeError(deps: MountDeps, ctx: RouteContext): boolean {
   if (getSecretKey()) return false;
   const key = process.env.STRIPE_SECRET_KEY?.trim();
   const reason = !key ? "STRIPE_SECRET_KEY is not set"
-    : "only test-mode keys (sk_test_*) are accepted; live keys are refused";
+    : isProduction()
+      ? "production requires a live key (sk_live_*); test keys are refused"
+      : "only test-mode keys (sk_test_*) are accepted outside production; live keys are refused";
   deps.sendJson(ctx.res, 503, {
     error: "stripe_not_configured",
     message: reason,
-    testmode: true,
+    ...stripeModeFlags(),
   });
   return true;
 }
@@ -271,13 +293,16 @@ export function mountStripeRoutes(deps: MountDeps): void {
     const key = process.env.STRIPE_SECRET_KEY?.trim();
     deps.sendJson(ctx.res, 200, {
       configured: !!getSecretKey(),
-      testmode: true,
-      livemode: false,
+      ...stripeModeFlags(),
       key_present: !!key,
       key_is_test: key?.startsWith("sk_test_") ?? false,
-      note: key && !key.startsWith("sk_test_")
-        ? "live key detected and refused — only sk_test_* accepted"
-        : undefined,
+      key_is_live: key?.startsWith("sk_live_") ?? false,
+      note: !key ? undefined
+        : isProduction() && !key.startsWith("sk_live_")
+          ? "production requires a live key (sk_live_*); this key is refused"
+          : !isProduction() && !key.startsWith("sk_test_")
+            ? "only test keys (sk_test_*) are accepted outside production; this key is refused"
+            : undefined,
     });
   });
 
@@ -338,7 +363,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
         { amountMinor: amount, currency, ledgerCreated });
     }
     deps.sendJson(ctx.res, status, {
-      testmode: true,
+      ...stripeModeFlags(),
       livemode: false,
       id: d.id,
       client_secret: d.client_secret,
@@ -366,7 +391,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
     const { status, data } = await stripeApi("GET", `/v1/payment_intents/${id}`);
     const d = data as Record<string, unknown>;
     deps.sendJson(ctx.res, status, {
-      testmode: true,
+      ...stripeModeFlags(),
       livemode: false,
       id: d.id,
       amount: d.amount,
@@ -390,7 +415,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
     const d = data as Record<string, unknown>;
     if (status >= 400) {
       deps.sendJson(ctx.res, status, {
-        testmode: true,
+        ...stripeModeFlags(),
         livemode: false,
         id,
         stripe_error: d.error,
@@ -429,7 +454,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
       );
     }
     deps.sendJson(ctx.res, 200, {
-      testmode: true,
+      ...stripeModeFlags(),
       livemode: false,
       id: d.id,
       stripe_status: d.status,
@@ -465,7 +490,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
       }
     }
     deps.sendJson(ctx.res, 200, {
-      testmode: true,
+      ...stripeModeFlags(),
       livemode: false,
       userId,
       totals, // minor units per currency, e.g. { CAD: { credited: "5000", pending: "0" } }
@@ -487,7 +512,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
       deps.sendJson(ctx.res, 503, {
         error: "stripe_webhook_not_configured",
         message: "STRIPE_WEBHOOK_SECRET is not set; webhooks are refused until it is.",
-        testmode: true,
+        ...stripeModeFlags(),
       });
       return;
     }
@@ -506,7 +531,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
     if (eventId) {
       const fresh = await dbMarkWebhookSeen(`stripe:${eventId}`);
       if (!fresh) {
-        deps.sendJson(ctx.res, 200, { testmode: true, received: true, action: "duplicate_ignored", event_id: eventId });
+        deps.sendJson(ctx.res, 200, { ...stripeModeFlags(), received: true, action: "duplicate_ignored", event_id: eventId });
         return;
       }
     }
@@ -545,8 +570,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
     await auditLog("stripe", "stripe_webhook", "stripe_event", eventId ?? undefined,
       { eventType, action, paymentIntentId: piId, ledgerId: ledger?.id ?? null });
     deps.sendJson(ctx.res, 200, {
-      testmode: true,
-      livemode: false,
+      ...stripeModeFlags(),
       received: true,
       action,
       event_id: eventId,
