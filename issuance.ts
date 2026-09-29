@@ -39,10 +39,11 @@ export interface IssuanceDraftInput {
   equityPublic?: number;
   equityRetained?: number;
   socialProfiles?: Array<{ platform: string; url: string }>;
+  websiteUrl?: string;
   priceUsd?: number; // issuer's starting price per whole coin, USD
 }
 
-export interface IssuanceDraft extends Required<Omit<IssuanceDraftInput, "category" | "tagline" | "valueThesis" | "equityPublic" | "equityRetained" | "socialProfiles" | "priceUsd">> {
+export interface IssuanceDraft extends Required<Omit<IssuanceDraftInput, "category" | "tagline" | "valueThesis" | "equityPublic" | "equityRetained" | "socialProfiles" | "websiteUrl" | "priceUsd">> {
   id: string;
   category: string;
   tagline: string;
@@ -50,6 +51,7 @@ export interface IssuanceDraft extends Required<Omit<IssuanceDraftInput, "catego
   equityPublic: number;
   equityRetained: number;
   socialProfiles: Array<{ platform: string; url: string }>;
+  websiteUrl: string | null;
   priceUsd: number; // issuer's starting price per whole coin, USD
   status: "draft" | "signed" | "minted";
   createdAt: string;
@@ -93,6 +95,8 @@ export interface IssuanceCoin {
   totalShares: number | null;
   /** Shares retained by the issuer = totalShares * draft.equityRetained / 100. */
   retainedShares: number | null;
+  /** Issuer's website URL (business/asset listings). Null if not provided. */
+  websiteUrl: string | null;
   network: "sovereign";
   idempotencyKey: string;
   createdAt: string;
@@ -202,16 +206,18 @@ class PgIssuanceStore implements IssuanceStore {
     const rows = await this.q<IssuanceDraft>(
       `INSERT INTO issuance_drafts
          (id, user_id, name, ticker, category, tagline, value_thesis, equity_public,
-          equity_retained, social_profiles, price_usd, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'draft')
+          equity_retained, social_profiles, website_url, price_usd, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'draft')
        RETURNING id, user_id AS "userId", name, ticker, category, tagline,
                  value_thesis AS "valueThesis", equity_public AS "equityPublic",
                  equity_retained AS "equityRetained",
-                 social_profiles AS "socialProfiles", price_usd AS "priceUsd",
+                 social_profiles AS "socialProfiles", website_url AS "websiteUrl",
+                 price_usd AS "priceUsd",
                  status,
                  created_at AS "createdAt", updated_at AS "updatedAt"`,
       [id, d.userId, d.name, d.ticker, d.category, d.tagline, d.valueThesis,
-       d.equityPublic, d.equityRetained, JSON.stringify(d.socialProfiles), d.priceUsd]
+       d.equityPublic, d.equityRetained, JSON.stringify(d.socialProfiles),
+       d.websiteUrl ?? null, d.priceUsd]
     );
     return rows[0]!;
   }
@@ -221,7 +227,8 @@ class PgIssuanceStore implements IssuanceStore {
       `SELECT id, user_id AS "userId", name, ticker, category, tagline,
               value_thesis AS "valueThesis", equity_public AS "equityPublic",
               equity_retained AS "equityRetained",
-              social_profiles AS "socialProfiles", price_usd AS "priceUsd",
+              social_profiles AS "socialProfiles", website_url AS "websiteUrl",
+              price_usd AS "priceUsd",
               status,
               created_at AS "createdAt", updated_at AS "updatedAt"
        FROM issuance_drafts WHERE id = $1`,
@@ -296,13 +303,13 @@ class PgIssuanceStore implements IssuanceStore {
       `INSERT INTO issuance_coins
          (id, draft_id, user_id, signature_id, is_meme, name, ticker,
           mint_address, tx_signature, supply, decimals, price_usd, issuer_address,
-          category, total_shares, retained_shares, network, idempotency_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'sovereign',$17)
+          category, total_shares, retained_shares, website_url, network, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'sovereign',$18)
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING ${COIN_COLS}`,
       [id, c.draftId, c.userId, c.signatureId, c.isMeme, c.name, c.ticker,
        c.mintAddress, c.txSignature, c.supply, c.decimals, c.priceUsd, c.issuerAddress ?? null,
-       c.category ?? null, c.totalShares ?? null, c.retainedShares ?? null, c.idempotencyKey]
+       c.category ?? null, c.totalShares ?? null, c.retainedShares ?? null, c.websiteUrl ?? null, c.idempotencyKey]
     );
     // Lost the race: another request with the same key already stored a coin.
     const existing = await this.getCoinByIdempotency(c.idempotencyKey);
@@ -329,6 +336,7 @@ const COIN_COLS = `id, draft_id AS "draftId", user_id AS "userId",
   mint_address AS "mintAddress", tx_signature AS "txSignature",
   supply, decimals, price_usd AS "priceUsd", issuer_address AS "issuerAddress",
   category, total_shares AS "totalShares", retained_shares AS "retainedShares",
+  website_url AS "websiteUrl",
   network, idempotency_key AS "idempotencyKey",
   created_at AS "createdAt"`;
 
@@ -582,6 +590,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         equityPublic,
         equityRetained,
         socialProfiles,
+        websiteUrl: str(body.websiteUrl ?? body.website_url).trim().slice(0, 500) || null,
         priceUsd,
       });
       sendJson(ctx.res, 201, { ...NETWORK_ENVELOPE, draftId: draft.id, status: draft.status, draft });
@@ -737,6 +746,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         category: draft.category || null,
         totalShares,
         retainedShares: Math.round((totalShares * draft.equityRetained) / 100),
+        websiteUrl: draft.websiteUrl || null,
         idempotencyKey: key,
       });
       await s.setDraftStatus(draftId, "minted");
