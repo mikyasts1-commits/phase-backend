@@ -856,7 +856,9 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
         throw new HttpError(422, "coin_not_priced", "This coin has no trade price yet.");
       }
-      const priceMicro = toMicroUnits(String(priceUsd));
+      // Authoritative conversion uses the raw DB decimal string — never the
+      // float round-trip (Number -> String can lose microunit precision).
+      const priceMicro = toMicroUnits(String(coin.priceUsd));
       const sellerUserId = coin.userId;
 
       // Self-trade guard: the issuer and buyer must be different accounts.
@@ -1126,7 +1128,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
         throw new HttpError(422, "coin_not_priced", "This coin has no trade price yet.");
       }
-      const priceMicro = toMicroUnits(String(priceUsd));
+      const priceMicro = toMicroUnits(String(coin.priceUsd)); // raw DB string, not the float
       // Integer-exact: units = floor(amount / price); fee = floor(units * bps / 10000).
       const units = amountMicro / priceMicro;
       if (units < 1n) {
@@ -1180,8 +1182,9 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       }
       // Integer-exact: target = floor(offer_units * offer_price / target_price),
       // fee = floor(target * bps / 10000), net = target - fee.
-      const targetPriceMicro = toMicroUnits(String(targetPrice));
-      const offerPriceMicro = toMicroUnits(String(offerPrice));
+      // Raw DB decimal strings — never the float round-trip.
+      const targetPriceMicro = toMicroUnits(String(target.priceUsd));
+      const offerPriceMicro = toMicroUnits(String(offer.priceUsd));
       const targetUnits = (offerUnits * offerPriceMicro) / targetPriceMicro;
       if (targetUnits < 1n) {
         throw new HttpError(422, "amount_too_small",
@@ -1330,9 +1333,9 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       }
 
       // Integer-exact: offer value = offer_units * offer_price (microunits);
-      // target units = floor(offer_value / target_price).
-      const targetPriceMicro = toMicroUnits(String(targetPrice));
-      const offerPriceMicro = toMicroUnits(String(offerPrice));
+      // target units = floor(offer_value / target_price). Raw DB strings.
+      const targetPriceMicro = toMicroUnits(String(target.priceUsd));
+      const offerPriceMicro = toMicroUnits(String(offer.priceUsd));
       const offerValueMicro = offerUnits * offerPriceMicro;
       const targetUnits = offerValueMicro / targetPriceMicro;
       if (targetUnits < 1n) {

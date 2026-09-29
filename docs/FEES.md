@@ -223,6 +223,11 @@ Run: `npx tsx test-fees-math.ts` (72 unit tests, no DB) and
 - [ ] Provider verification, KYC/AML, legal approval, Play declarations
 - [ ] Device-tested release build
 
+**Out of scope for v1:** `securities.ts` (tokenized stocks/ETFs) is
+testnet/sandbox-only, unmounted from the fee engine, and uses JS floats
+end-to-end — it must not be fee-bearing until it is rebuilt on exact
+integer math and integrated with the fee ledger.
+
 Gross transaction volume is **not** Phase revenue. Phase revenue is the
 collected fee units only, recognized when the fee settles on-chain and is
 recorded in the fee ledger.
