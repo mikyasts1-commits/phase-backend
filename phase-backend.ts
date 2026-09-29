@@ -1123,15 +1123,14 @@ mountAuthRoutes({ route, sendJson, HttpError });
 
 // --- TEMPORARY ADMIN: wipe all users (remove after use) ---
 route("POST", "/api/v1/admin/wipe-users", async (ctx) => {
-  const { db } = await import("./db.js");
-  const pool = db();
-  const users = await pool.query("SELECT id, email FROM issuance_users");
-  await pool.query("DELETE FROM issuance_users");
+  const { dbQuery } = await import("./db.js");
+  const users = await dbQuery("SELECT id, email FROM issuance_users");
+  await dbQuery("DELETE FROM issuance_users");
   // Clear any orphaned demo data in non-cascading tables
-  await pool.query("DELETE FROM ledger_entries").catch(() => {});
-  await pool.query("DELETE FROM market_trades").catch(() => {});
-  await pool.query("DELETE FROM market_balances").catch(() => {});
-  sendJson(ctx.res, 200, { ok: true, wiped: users.rows.map((u: any) => u.email) });
+  await dbQuery("DELETE FROM ledger_entries").catch(() => {});
+  await dbQuery("DELETE FROM market_trades").catch(() => {});
+  await dbQuery("DELETE FROM market_balances").catch(() => {});
+  sendJson(ctx.res, 200, { ok: true, wiped: users.map((u: any) => u.email) });
 });
 
 // --- 8e-vi. Sovereign ledger (Phase 1 MVP; see sovereign-ledger.ts) ---
