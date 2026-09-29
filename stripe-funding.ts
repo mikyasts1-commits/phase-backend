@@ -46,6 +46,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 import { dbQuery, dbQueryOne } from "./db.js";
+import { resolveBearerUserId } from "./auth.js";
 
 interface MountDeps {
   route: (method: string, path: string, handler: (ctx: RouteContext) => void | Promise<void>) => void;
@@ -224,16 +225,22 @@ async function failFiatLedgerEntry(paymentIntentId: string): Promise<FiatLedgerE
   );
 }
 
-function requireUserId(
-  query: URLSearchParams,
-  body: Record<string, unknown> | undefined,
+// The userId for private routes ALWAYS comes from the authenticated Bearer
+// session. A client-supplied userId in the body/query is never trusted: if
+// one is present and disagrees with the session, the request is rejected.
+async function requireUserId(
+  ctx: { req: { headers: Record<string, string | string[] | undefined> }; query: URLSearchParams; body: unknown },
   HttpError: new (statusCode: number, code: string, message: string) => Error,
-): string {
-  const v = query.get("userId") ?? (typeof body?.userId === "string" ? body.userId : null);
-  if (!v || !v.trim()) {
-    throw new HttpError(400, "missing_user_id", "userId is required (query param or JSON body).");
+): Promise<string> {
+  const authed = await resolveBearerUserId(ctx.req.headers);
+  if (!authed) throw new HttpError(401, "unauthorized", "Sign in required.");
+  const body = (ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
+    ? ctx.body : {}) as Record<string, unknown>;
+  const claimed = (typeof body.userId === "string" ? body.userId : null) || ctx.query.get("userId");
+  if (claimed && claimed !== authed) {
+    throw new HttpError(403, "forbidden", "This request is for a different user.");
   }
-  return v.trim();
+  return authed;
 }
 
 function requireBodyObject(
@@ -266,7 +273,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
   deps.route("POST", "/api/v1/stripe/payment-intents", async (ctx) => {
     if (stripeError(deps, ctx)) return;
     const b = requireBodyObject(ctx.body, deps.HttpError);
-    const userId = requireUserId(ctx.query, b, deps.HttpError);
+    const userId = await requireUserId(ctx, deps.HttpError);
     const amount = Number(b.amount);
     const currency = String(b.currency ?? "cad").toLowerCase();
     if (!Number.isInteger(amount) || amount < 50) {
@@ -411,7 +418,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
   // --- Fiat balances: credited vs pending per currency ---
   deps.route("GET", "/api/v1/stripe/balances", async (ctx) => {
     if (stripeError(deps, ctx)) return;
-    const userId = requireUserId(ctx.query, undefined, deps.HttpError);
+    const userId = await requireUserId(ctx, deps.HttpError);
     const rows = await dbQuery<{ currency: string; status: string; verified: boolean; total: string }>(
       `SELECT currency, status, verified, SUM(amount::numeric)::text AS total
        FROM ledger_entries

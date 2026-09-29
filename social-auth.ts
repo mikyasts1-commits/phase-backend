@@ -25,6 +25,7 @@
  */
 
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { resolveBearerUserId } from "./auth.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -455,6 +456,22 @@ export function mountSocialRoutes(deps: RouteCtx, store?: SocialStore) {
   const { route, sendJson, HttpError } = deps;
   const db: SocialStore = store || new MemorySocialStore();
 
+  // The userId for private routes ALWAYS comes from the authenticated Bearer
+  // session. A client-supplied userId in the body/query is never trusted: if
+  // one is present and disagrees with the session, the request is rejected.
+  const requireSessionUserId = async (ctx: { req: any; url: URL; body: unknown }): Promise<string> => {
+    const headers = (ctx.req?.headers ?? {}) as Record<string, string | string[] | undefined>;
+    const authed = await resolveBearerUserId(headers);
+    if (!authed) throw new HttpError(401, "unauthorized", "Sign in required.");
+    const body = (ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
+      ? ctx.body : {}) as Record<string, unknown>;
+    const claimed = (typeof body.userId === "string" ? body.userId : null) || ctx.url.searchParams.get("userId");
+    if (claimed && claimed !== authed) {
+      throw new HttpError(403, "forbidden", "This request is for a different user.");
+    }
+    return authed;
+  };
+
   const getProvider = (name: string): ProviderConfig => {
     const p = PROVIDERS[name as SocialProvider];
     if (!p) throw new HttpError(404, "unknown_provider", `Unknown provider: ${name}`);
@@ -473,11 +490,10 @@ export function mountSocialRoutes(deps: RouteCtx, store?: SocialStore) {
     });
   });
 
-  // Start OAuth flow — returns the authorization URL
+  // Start OAuth flow — returns the authorization URL (bound to the session user)
   route("GET", "/api/v1/social/:provider/authorize", async (ctx) => {
     const p = getProvider(ctx.params.provider);
-    const userId = ctx.url.searchParams.get("userId");
-    if (!userId) throw new HttpError(400, "missing_user", "userId query param required");
+    const userId = await requireSessionUserId(ctx);
     const state = `st_${randomBytes(16).toString("hex")}`;
     const codeVerifier = generateCodeVerifier();
     const codeChallenge = await generateCodeChallenge(codeVerifier);
@@ -522,8 +538,7 @@ export function mountSocialRoutes(deps: RouteCtx, store?: SocialStore) {
 
   // List a user's connections (public profile data only — no tokens)
   route("GET", "/api/v1/social/connections", async (ctx) => {
-    const userId = ctx.url.searchParams.get("userId");
-    if (!userId) throw new HttpError(400, "missing_user", "userId query param required");
+    const userId = await requireSessionUserId(ctx);
     const conns = await db.listConnections(userId);
     return sendJson({ connections: conns });
   });
@@ -532,20 +547,17 @@ export function mountSocialRoutes(deps: RouteCtx, store?: SocialStore) {
   route("DELETE", "/api/v1/social/:provider", async (ctx) => {
     const provider = ctx.params.provider as SocialProvider;
     if (!PROVIDERS[provider]) throw new HttpError(404, "unknown_provider", `Unknown provider: ${provider}`);
-    const body = (ctx.body || {}) as { userId?: string };
-    const userId = body.userId || ctx.url.searchParams.get("userId");
-    if (!userId) throw new HttpError(400, "missing_user", "userId required");
+    const userId = await requireSessionUserId(ctx);
     await db.deleteConnection(userId, provider);
     return sendJson({ disconnected: true, provider });
   });
 
   // Refresh follower counts for all of a user's connections
   route("POST", "/api/v1/social/refresh", async (ctx) => {
-    const body = (ctx.body || {}) as { userId?: string };
-    if (!body.userId) throw new HttpError(400, "missing_user", "userId required");
+    const userId = await requireSessionUserId(ctx);
     // NOTE: full refresh needs stored tokens; in-memory store keeps them.
     // Postgres implementation should decrypt and re-fetch profiles.
-    const conns = await db.listConnections(body.userId);
+    const conns = await db.listConnections(userId);
     return sendJson({ refreshed: conns.length, connections: conns });
   });
 }

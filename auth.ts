@@ -21,6 +21,8 @@
  */
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { getPool } from "./db.js";
+import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
+import { auditLog } from "./audit.js";
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const SCRYPT_KEYLEN = 64;
@@ -65,14 +67,17 @@ export interface AuthStore {
   // Password reset
   createPasswordResetToken(userId: string): Promise<string>;
   validatePasswordResetToken(token: string): Promise<string | null>; // returns userId
-  usePasswordResetToken(token: string, newPasswordHash: string): Promise<boolean>;
+  usePasswordResetToken(token: string, newPasswordHash: string): Promise<string | null>;
   // Email verification
   createEmailVerificationToken(userId: string): Promise<string>;
-  verifyEmailToken(token: string): Promise<boolean>;
+  verifyEmailToken(token: string): Promise<string | null>;
   isEmailVerified(userId: string): Promise<boolean>;
   // Login rate limiting
   recordLoginAttempt(email: string, ip: string, success: boolean): Promise<void>;
   countRecentFailedLogins(email: string, ip: string, sinceMinutes: number): Promise<number>;
+  // Account deletion
+  verifyPasswordForUser(userId: string, password: string): Promise<boolean>;
+  deleteAccount(userId: string): Promise<void>;
 }
 
 class PgAuthStore implements AuthStore {
@@ -150,14 +155,14 @@ class PgAuthStore implements AuthStore {
     return rows[0]?.userId ?? null;
   }
 
-  async usePasswordResetToken(token: string, newPasswordHash: string): Promise<boolean> {
+  async usePasswordResetToken(token: string, newPasswordHash: string): Promise<string | null> {
     const userId = await this.validatePasswordResetToken(token);
-    if (!userId) return false;
+    if (!userId) return null;
     await this.q(`UPDATE issuance_users SET password_hash = $1 WHERE id = $2`, [newPasswordHash, userId]);
     await this.q(`UPDATE password_reset_tokens SET used_at = now() WHERE token = $1`, [token]);
     // Invalidate all sessions for security
     await this.q(`DELETE FROM auth_sessions WHERE user_id = $1`, [userId]);
-    return true;
+    return userId;
   }
 
   async createEmailVerificationToken(userId: string): Promise<string> {
@@ -169,17 +174,17 @@ class PgAuthStore implements AuthStore {
     return token;
   }
 
-  async verifyEmailToken(token: string): Promise<boolean> {
+  async verifyEmailToken(token: string): Promise<string | null> {
     const rows = await this.q<{ userId: string }>(
       `SELECT user_id AS "userId" FROM email_verification_tokens
        WHERE token = $1 AND expires_at > now() AND used_at IS NULL`,
       [token]
     );
     const userId = rows[0]?.userId;
-    if (!userId) return false;
+    if (!userId) return null;
     await this.q(`UPDATE issuance_users SET email_verified = TRUE WHERE id = $1`, [userId]);
     await this.q(`UPDATE email_verification_tokens SET used_at = now() WHERE token = $1`, [token]);
-    return true;
+    return userId;
   }
 
   async isEmailVerified(userId: string): Promise<boolean> {
@@ -206,6 +211,60 @@ class PgAuthStore implements AuthStore {
       [email, ip, String(sinceMinutes)]
     );
     return parseInt(rows[0]?.count || "0", 10);
+  }
+
+  async verifyPasswordForUser(userId: string, password: string): Promise<boolean> {
+    const rows = await this.q<{ passwordHash: string | null }>(
+      `SELECT password_hash AS "passwordHash" FROM issuance_users WHERE id = $1`,
+      [userId]
+    );
+    const stored = rows[0]?.passwordHash;
+    if (!stored) return false;
+    return verifyPassword(password, stored);
+  }
+
+  // Account deletion
+  // ---------------------------------------------------------------------------
+  // Deletes the user and ALL user-owned data. Tables that do not cascade from
+  // issuance_users are cleared first; issuance/auth rows cascade from the user.
+  // ---------------------------------------------------------------------------
+  async deleteAccount(userId: string): Promise<void> {
+    const pool = getPool();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Tables keyed by user_id without a cascading FK to issuance_users.
+      await client.query(`DELETE FROM market_trades WHERE buyer_id = $1 OR seller_id = $1`, [userId]);
+      await client.query(`DELETE FROM settlement_attempts WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM market_balances WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM ledger_entries WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM securities_orders WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM securities_positions WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM securities_ledger WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM social_connections WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM social_oauth_states WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM user_wallets WHERE user_id = $1`, [userId]);
+      // Sovereign chains minted by this user (issuance_coins cascades via chain).
+      await client.query(
+        `DELETE FROM sovereign_chains
+         WHERE did IN (SELECT did FROM issuance_coins WHERE user_id = $1)`,
+        [userId]
+      );
+      // Login-attempt rows referencing this account's email.
+      await client.query(
+        `DELETE FROM login_attempts
+         WHERE lower(email) = (SELECT lower(email) FROM issuance_users WHERE id = $1)`,
+        [userId]
+      );
+      // Finally the user row; issuance/auth/session/reset rows cascade.
+      await client.query(`DELETE FROM issuance_users WHERE id = $1`, [userId]);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 }
 
@@ -269,9 +328,9 @@ class MemoryAuthStore implements AuthStore {
     return t.userId;
   }
 
-  async usePasswordResetToken(token: string, newPasswordHash: string): Promise<boolean> {
+  async usePasswordResetToken(token: string, newPasswordHash: string): Promise<string | null> {
     const userId = await this.validatePasswordResetToken(token);
-    if (!userId) return false;
+    if (!userId) return null;
     const acc = this.accounts.get(userId);
     if (acc) acc.passwordHash = newPasswordHash;
     this.resetTokens.get(token)!.used = true;
@@ -279,7 +338,7 @@ class MemoryAuthStore implements AuthStore {
     for (const [tok, s] of this.sessions) {
       if (s.userId === userId) this.sessions.delete(tok);
     }
-    return true;
+    return userId;
   }
 
   async createEmailVerificationToken(userId: string): Promise<string> {
@@ -288,12 +347,12 @@ class MemoryAuthStore implements AuthStore {
     return token;
   }
 
-  async verifyEmailToken(token: string): Promise<boolean> {
+  async verifyEmailToken(token: string): Promise<string | null> {
     const t = this.verifyTokens.get(token);
-    if (!t || t.used || t.expiresAt <= Date.now()) return false;
+    if (!t || t.used || t.expiresAt <= Date.now()) return null;
     this.verifiedEmails.add(t.userId);
     t.used = true;
-    return true;
+    return t.userId;
   }
 
   async isEmailVerified(userId: string): Promise<boolean> {
@@ -312,6 +371,28 @@ class MemoryAuthStore implements AuthStore {
     return this.loginAttempts.filter(
       (a) => !a.success && a.at > cutoff && (a.email === e || a.ip === ip)
     ).length;
+  }
+
+  async verifyPasswordForUser(userId: string, password: string): Promise<boolean> {
+    const acc = this.accounts.get(userId);
+    if (!acc?.passwordHash) return false;
+    return verifyPassword(password, acc.passwordHash);
+  }
+
+  async deleteAccount(userId: string): Promise<void> {
+    const acc = this.accounts.get(userId);
+    if (acc) this.byEmail.delete(acc.email.toLowerCase());
+    this.accounts.delete(userId);
+    this.verifiedEmails.delete(userId);
+    for (const [tok, s] of this.sessions) {
+      if (s.userId === userId) this.sessions.delete(tok);
+    }
+    for (const [tok, t] of this.resetTokens) {
+      if (t.userId === userId) this.resetTokens.delete(tok);
+    }
+    for (const [tok, t] of this.verifyTokens) {
+      if (t.userId === userId) this.verifyTokens.delete(tok);
+    }
   }
 }
 
@@ -377,11 +458,7 @@ function bearerToken(ctx: AuthCtx): string | null {
 }
 
 function clientIp(ctx: AuthCtx): string {
-  const h = ctx.req.headers;
-  const fwd = h["x-forwarded-for"] ?? h["x-real-ip"];
-  const first = Array.isArray(fwd) ? fwd[0] : fwd;
-  if (typeof first === "string" && first) return first.split(",")[0].trim();
-  return "unknown";
+  return clientIpFromHeaders(ctx.req.headers);
 }
 
 // Shared session resolver for other route modules (issuance, marketplace).
@@ -422,6 +499,10 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
   // --- POST /api/v1/auth/signup ---
   route("POST", "/api/v1/auth/signup", async (ctx) => {
     try {
+      const ip = clientIp(ctx);
+      if (!checkRateLimit(`auth:signup:${ip}`, 5, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many signup attempts — wait a minute and try again.");
+      }
       const body = asRecord(ctx.body);
       const email = str(body.email).trim().toLowerCase();
       const password = str(body.password);
@@ -456,13 +537,14 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
       }
 
       const session = await s.createSession(account.id);
-      // Generate email verification token (in production, this would be emailed)
+      // Generate email verification token. TODO: send via email; for now it
+      // is only logged server-side and NEVER returned in the API response.
       const verificationToken = await s.createEmailVerificationToken(account.id);
+      console.log(`[auth] email verification token for ${account.id}: ${verificationToken} (TODO: email this)`);
       sendJson(ctx.res, 201, {
         ...accountPayload(account),
         token: session.token,
         expiresAt: session.expiresAt,
-        verificationToken,
         emailVerified: false,
       });
     } catch (err) { fail(ctx, err); }
@@ -496,6 +578,7 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
 
       await s.recordLoginAttempt(email, ip, true);
       const session = await s.createSession(account.id);
+      await auditLog(account.id, "login_success", "issuance_users", account.id, {});
       sendJson(ctx.res, 200, { ...accountPayload(account), token: session.token, expiresAt: session.expiresAt });
     } catch (err) { fail(ctx, err); }
   });
@@ -528,11 +611,44 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
     } catch (err) { fail(ctx, err); }
   });
 
+  // --- DELETE /api/v1/auth/account ---
+  // Permanently deletes the authenticated user's account and all user data.
+  // Requires Bearer auth + current password confirmation. Rate limited to
+  // 3 attempts per hour per user.
+  route("DELETE", "/api/v1/auth/account", async (ctx) => {
+    try {
+      const userId = await resolveBearerUserId(ctx.req.headers);
+      if (!userId) {
+        throw new HttpError(401, "unauthorized", "Sign in to delete your account.");
+      }
+      if (!checkRateLimit(`auth:delete:${userId}`, 3, 3_600_000)) {
+        throw new HttpError(429, "rate_limited", "Too many deletion attempts — try again later.");
+      }
+      const body = asRecord(ctx.body);
+      const password = str(body.password);
+      if (!password) {
+        throw new HttpError(400, "missing_password", "Current password is required to delete your account.");
+      }
+      const s = await store();
+      const ok = await s.verifyPasswordForUser(userId, password);
+      if (!ok) {
+        throw new HttpError(403, "invalid_password", "Password is incorrect.");
+      }
+      await s.deleteAccount(userId);
+      auditLog("auth.account_deleted", { userId });
+      sendJson(ctx.res, 200, { ok: true });
+    } catch (err) { fail(ctx, err); }
+  });
+
   // --- POST /api/v1/auth/forgot-password ---
   // Generates a password reset token. In production this would be emailed;
   // for now the token is returned so the app can display it (dev mode).
   route("POST", "/api/v1/auth/forgot-password", async (ctx) => {
     try {
+      const ip = clientIp(ctx);
+      if (!checkRateLimit(`auth:forgot:${ip}`, 3, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many reset requests — wait a minute and try again.");
+      }
       const body = asRecord(ctx.body);
       const email = str(body.email).trim().toLowerCase();
       if (!EMAIL_RE.test(email)) {
@@ -543,7 +659,9 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
       // Always return success to avoid revealing whether the email exists.
       if (account && account.passwordHash) {
         const token = await s.createPasswordResetToken(account.id);
-        sendJson(ctx.res, 200, { ok: true, resetToken: token, message: "If an account exists for this email, a reset token was generated." });
+        // TODO: send via email; for now only logged server-side, NEVER returned.
+        console.log(`[auth] password reset token for ${account.id}: ${token} (TODO: email this)`);
+        sendJson(ctx.res, 200, { ok: true, message: "If an account exists for this email, a reset token was generated." });
       } else {
         sendJson(ctx.res, 200, { ok: true, message: "If an account exists for this email, a reset token was generated." });
       }
@@ -553,6 +671,10 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
   // --- POST /api/v1/auth/reset-password ---
   route("POST", "/api/v1/auth/reset-password", async (ctx) => {
     try {
+      const ip = clientIp(ctx);
+      if (!checkRateLimit(`auth:reset:${ip}`, 5, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many reset attempts — wait a minute and try again.");
+      }
       const body = asRecord(ctx.body);
       const token = str(body.token).trim();
       const password = str(body.password);
@@ -561,8 +683,9 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
         throw new HttpError(422, "weak_password", "Password must be at least 8 characters.");
       }
       const s = await store();
-      const ok = await s.usePasswordResetToken(token, hashPassword(password));
-      if (!ok) throw new HttpError(400, "invalid_token", "Reset token is invalid or expired.");
+      const resetUserId = await s.usePasswordResetToken(token, hashPassword(password));
+      if (!resetUserId) throw new HttpError(400, "invalid_token", "Reset token is invalid or expired.");
+      await auditLog(resetUserId, "password_reset", "issuance_users", resetUserId, {});
       sendJson(ctx.res, 200, { ok: true, message: "Password has been reset. Please log in with your new password." });
     } catch (err) { fail(ctx, err); }
   });
@@ -592,7 +715,9 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
         return;
       }
       const token = await s.createEmailVerificationToken(userId);
-      sendJson(ctx.res, 200, { ok: true, verificationToken: token });
+      // TODO: send via email; for now only logged server-side, NEVER returned.
+      console.log(`[auth] email verification token for user ${userId}: ${token} (TODO: email this)`);
+      sendJson(ctx.res, 200, { ok: true, message: "If an account exists for this email, a verification token was generated." });
     } catch (err) { fail(ctx, err); }
   });
 }

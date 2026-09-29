@@ -21,6 +21,7 @@
  */
 
 import { createHmac } from "node:crypto";
+import { resolveBearerUserId } from "./auth.js";
 import * as bitcoin from "bitcoinjs-lib";
 import { ECPairFactory } from "ecpair";
 import * as ecc from "tiny-secp256k1";
@@ -130,17 +131,23 @@ interface BtcMountDeps {
 export function mountBtcRoutes(deps: BtcMountDeps): void {
   const { route, sendJson, HttpError } = deps;
 
-  const requireUserId = (query: URLSearchParams): string => {
-    const userId = (query.get("userId") || "").trim();
-    if (!userId) throw new HttpError(400, "missing_user", "userId query param required");
-    if (userId.length > 128) throw new HttpError(400, "invalid_user", "userId too long");
-    return userId;
+  // The userId for private routes ALWAYS comes from the authenticated Bearer
+  // session. A client-supplied userId in the query is never trusted: if one
+  // is present and disagrees with the session, the request is rejected.
+  const requireUserId = async (ctx: { req: { headers: Record<string, string | string[] | undefined> }; query: URLSearchParams }): Promise<string> => {
+    const authed = await resolveBearerUserId(ctx.req.headers);
+    if (!authed) throw new HttpError(401, "unauthorized", "Sign in required.");
+    const claimed = ctx.query.get("userId");
+    if (claimed && claimed !== authed) {
+      throw new HttpError(403, "forbidden", "This request is for a different user.");
+    }
+    return authed;
   };
 
   // --- GET /api/v1/funding/btc/address?userId= ---
   route("GET", "/api/v1/funding/btc/address", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const { address, network } = btcAddressForUser(userId);
       sendJson(ctx.res, 200, {
         ...networkEnvelope(),
@@ -159,7 +166,7 @@ export function mountBtcRoutes(deps: BtcMountDeps): void {
   // --- GET /api/v1/funding/btc/balance?userId= ---
   route("GET", "/api/v1/funding/btc/balance", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const { address } = btcAddressForUser(userId);
       const balance = await btcBalanceForAddress(address);
       sendJson(ctx.res, 200, {

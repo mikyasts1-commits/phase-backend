@@ -33,6 +33,7 @@
 import { getPool, migrate } from "./db.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { resolveBearerUserId } from "./auth.js";
 
 // ============================================================================
 // 1. ERRORS
@@ -896,6 +897,7 @@ export interface SecuritiesMountDeps {
 }
 
 export interface RouteContextLike {
+  req?: any;
   res: unknown;
   params: Record<string, string>;
   query: URLSearchParams;
@@ -907,10 +909,20 @@ function asRecord(body: unknown): Record<string, unknown> {
   throw new SecuritiesHttpError(400, "invalid_json_body", "Request body must be a JSON object.");
 }
 
-function requireUserId(query: URLSearchParams, body?: Record<string, unknown>): string {
-  const v = query.get("userId") ?? (typeof body?.userId === "string" ? body.userId : null);
-  if (!v || !v.trim()) throw new SecuritiesHttpError(400, "missing_user_id", "userId is required (query param or JSON body).");
-  return v.trim();
+// The userId for private routes ALWAYS comes from the authenticated Bearer
+// session. A client-supplied userId in the body/query is never trusted: if
+// one is present and disagrees with the session, the request is rejected.
+async function requireUserId(ctx: RouteContextLike): Promise<string> {
+  const headers = ((ctx.req?.headers ?? {}) as Record<string, string | string[] | undefined>);
+  const authed = await resolveBearerUserId(headers);
+  if (!authed) throw new SecuritiesHttpError(401, "unauthorized", "Sign in required.");
+  const body = (ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
+    ? ctx.body : {}) as Record<string, unknown>;
+  const claimed = (typeof body.userId === "string" ? body.userId : null) || ctx.query.get("userId");
+  if (claimed && claimed !== authed) {
+    throw new SecuritiesHttpError(403, "forbidden", "This request is for a different user.");
+  }
+  return authed;
 }
 
 function toHttpError(err: unknown, HttpError: SecuritiesMountDeps["HttpError"]): Error {
@@ -963,7 +975,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   route("POST", "/api/v1/securities/orders", async (ctx) => {
     try {
       const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx.query, body);
+      const userId = await requireUserId(ctx);
       const { order, created } = await placeOrder({
         userId,
         instrumentId: String(body.instrumentId ?? ""),
@@ -982,7 +994,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   // --- DELETE /api/v1/securities/orders/:id?userId= ---
   route("DELETE", "/api/v1/securities/orders/:id", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const order = await cancelOrder(userId, ctx.params.id);
       ok(ctx, 200, { order });
     } catch (err) {
@@ -993,7 +1005,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   // --- GET /api/v1/securities/positions?userId= ---
   route("GET", "/api/v1/securities/positions", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const positions = await getPositions(userId);
       ok(ctx, 200, { userId, positions, count: positions.length });
     } catch (err) {
@@ -1004,7 +1016,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   // --- GET /api/v1/securities/orders?userId=&status= ---
   route("GET", "/api/v1/securities/orders", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const orders = await getOrders(userId, {
         status: ctx.query.get("status") ?? undefined,
         limit: ctx.query.get("limit") ? Number(ctx.query.get("limit")) : undefined,
@@ -1018,7 +1030,7 @@ export function mountSecuritiesRoutes(deps: SecuritiesMountDeps): void {
   // --- GET /api/v1/securities/transactions?userId=&limit= ---
   route("GET", "/api/v1/securities/transactions", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const transactions = await getTransactions(
         userId,
         ctx.query.get("limit") ? Number(ctx.query.get("limit")) : 50

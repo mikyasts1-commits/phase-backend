@@ -59,7 +59,7 @@ import { mountFundingRoutes } from "./crypto-funding.js";
 import { mountBtcRoutes } from "./btc-funding.js";
 import { mountStripeRoutes } from "./stripe-funding.js";
 import { mountIssuanceRoutes } from "./issuance.js";
-import { mountAuthRoutes } from "./auth.js";
+import { mountAuthRoutes, resolveBearerUserId } from "./auth.js";
 import { mountSovereignLedgerRoutes } from "./sovereign-ledger.js";
 import { mountMarketplaceRoutes } from "./marketplace.js";
 import { mountLegalDocsRoutes } from "./legal-docs.js";
@@ -241,6 +241,10 @@ interface Profile {
 /** did -> active boolean. The whitelistGateway middleware checks this. */
 const activeWhitelists = new Map<string, boolean>();
 
+/** did -> session userId that bootstrapped it. The whitelistGateway
+ *  middleware requires the Bearer session user to own the asserted DID. */
+const didOwners = new Map<string, string>();
+
 /** did -> Profile, object-isolated: each DID has its own independent lock. */
 const profiles = new ObjectStore<Profile>();
 
@@ -306,49 +310,9 @@ const marketplaceDirectory = new ObjectStore<AssetListing>();
  *  fast read-side helper, never the source of truth for the race check. */
 const tickerRegistry = new Set<string>();
 
-async function seedZeroStateListing(): Promise<void> {
-  const seedDid = "did:phase:genesis";
-  await createProfile(seedDid);
-
-  const seedTicker = "PH-GENESIS";
-  const initialPrice = 1.0;
-
-  const listing: AssetListing = {
-    assetId: randomUUID(),
-    ownerDid: seedDid,
-    assetName: "Phase Genesis Demo Asset",
-    assetTicker: seedTicker,
-    assetClass: "SOFT",
-    subSector: "Demonstration",
-    valueProposition:
-      "A zero-state seed listing so new developers can explore valuation, " +
-      "trading, and the price-flash feed before launching their own asset.",
-    publicSalePercentage: 60,
-    retainedPercentage: 40,
-    totalShares: 1_000_000,
-    publicShares: 600_000,
-    retainedShares: 400_000,
-    currentPriceUsd: initialPrice,
-    initialPriceUsd: initialPrice,
-    tickDirection: "FLAT",
-    externalReferenceUrl: "https://en.wikipedia.org/wiki/Tokenization_(data_security)",
-    isLive: true,
-    createdAt: new Date().toISOString(),
-  };
-
-  await marketplaceDirectory.withLock(seedTicker, () => {
-    tickerRegistry.add(seedTicker);
-    return { result: undefined, next: listing };
-  });
-
-  await profiles.withLock(seedDid, (profile) => {
-    if (!profile) throw new Error("seed profile vanished unexpectedly");
-    profile.holdings[seedTicker] = listing.retainedShares;
-    return { result: undefined, next: profile };
-  });
-
-  appendBlock("ASSET_LAUNCH", { ...listing });
-}
+// REMOVED (production): seedZeroStateListing() seeded a "Phase Genesis Demo
+// Asset" on every boot. The marketplace directory is now populated only by
+// real issuance through the /api/v1/issuance flow.
 
 // ============================================================================
 // 4. MOCK MARKET RATES (tri-denomination conversion)
@@ -507,6 +471,12 @@ function readRawBody(req: IncomingMessage): Promise<Buffer> {
  */
 function whitelistGateway(handler: RouteHandler): RouteHandler {
   return async (ctx) => {
+    // Bearer <redacted> is required IN ADDITION to the DID whitelist check.
+    // The session userId must own the asserted DID.
+    const sessionUserId = await resolveBearerUserId(ctx.req.headers);
+    if (!sessionUserId) {
+      throw new HttpError(401, "unauthorized", "Sign in required.");
+    }
     const body = ctx.body as Record<string, unknown> | undefined;
     const did =
       typeof body?.ownerDid === "string"
@@ -531,6 +501,9 @@ function whitelistGateway(handler: RouteHandler): RouteHandler {
     if (!isActive) {
       throw new HttpError(403, "unauthorized_did", `DID '${did}' is not an active whitelisted identity`);
     }
+    if (didOwners.get(did) !== sessionUserId) {
+      throw new HttpError(403, "forbidden", "This DID belongs to a different user.");
+    }
 
     await handler(ctx);
   };
@@ -542,14 +515,25 @@ function whitelistGateway(handler: RouteHandler): RouteHandler {
 
 // --- 8a. Bootstrap: create a profile, auto-whitelist, grant signup bonus ---
 route("POST", "/api/v1/profile/bootstrap", async (ctx) => {
+  // Bootstrap requires a valid Bearer session and binds the DID to it.
+  // A DID already owned by a different user cannot be taken over.
+  const sessionUserId = await resolveBearerUserId(ctx.req.headers);
+  if (!sessionUserId) {
+    throw new HttpError(401, "unauthorized", "Sign in required.");
+  }
   const body = ctx.body as { did?: string } | undefined;
   const did = body?.did?.trim();
 
   if (!did || !did.startsWith("did:phase:")) {
     throw new HttpError(400, "invalid_did", "Body must include `did` in the form did:phase:xxxx");
   }
+  const existingOwner = didOwners.get(did);
+  if (existingOwner && existingOwner !== sessionUserId) {
+    throw new HttpError(403, "forbidden", "This DID is already registered to a different user.");
+  }
 
   const profile = await createProfile(did);
+  didOwners.set(did, sessionUserId);
   sendJson(ctx.res, 201, {
     message: "Profile created, whitelisted, and signup bonus granted.",
     profile,
@@ -972,15 +956,9 @@ route(
 );
 
 // --- 8e. Marketplace directory listing (read-only, for the UI) ---
-route("GET", "/api/v1/marketplace/directory", async (ctx) => {
-  // Plain snapshot read — no lock needed. Reading the directory doesn't
-  // need to block on, or be blocked by, in-flight writes to any single
-  // asset; a snapshot that's microseconds stale is fine for a listing view.
-  sendJson(ctx.res, 200, {
-    count: marketplaceDirectory.size,
-    assets: marketplaceDirectory.values(),
-  });
-});
+// REMOVED (production): GET /api/v1/marketplace/directory served the legacy
+// in-memory mock directory. The real marketplace listing is
+// GET /api/v1/marketplace/coins (Postgres-backed, see marketplace.ts).
 
 // --- 8e. Tri-Denomination Portfolio Valuation ---
 route("GET", "/api/v1/portfolio/valuation", async (ctx) => {
@@ -1231,12 +1209,10 @@ const server = createServer((req, res) => {
 const PORT = Number(process.env.PORT ?? 4100);
 
 async function main(): Promise<void> {
-  await seedZeroStateListing();
   startPriceDaemon();
 
   server.listen(PORT, () => {
-    console.log(`Phase Protocol mock backend listening on http://localhost:${PORT}`);
-    console.log(`Seeded with profile did:phase:genesis and asset PH-GENESIS`);
+    console.log(`Phase Protocol backend listening on http://localhost:${PORT}`);
     console.log(`Price-flash daemon ticking every ${PRICE_TICK_INTERVAL_MS}ms`);
   });
 }

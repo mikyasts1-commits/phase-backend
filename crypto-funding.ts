@@ -95,6 +95,7 @@ import {
 } from "node:crypto";
 import type { RouteContext, RouteHandler } from "./phase-backend.js";
 import { dbQuery, dbQueryOne } from "./db.js";
+import { resolveBearerUserId } from "./auth.js";
 
 // ============================================================================
 // 1. CONFIG & NETWORK SAFETY
@@ -1317,10 +1318,19 @@ function asRecord(body: unknown): Record<string, unknown> {
   throw new FundingHttpError(400, "invalid_json_body", "Request body must be a JSON object.");
 }
 
-function requireUserId(query: URLSearchParams, body?: Record<string, unknown>): string {
-  const v = query.get("userId") ?? (typeof body?.userId === "string" ? body.userId : null);
-  if (!v || !v.trim()) throw new FundingHttpError(400, "missing_user_id", "userId is required (query param or JSON body).");
-  return v.trim();
+// The userId for private routes ALWAYS comes from the authenticated Bearer
+// session. A client-supplied userId in the body/query is never trusted: if
+// one is present and disagrees with the session, the request is rejected.
+async function requireUserId(ctx: RouteContext): Promise<string> {
+  const authed = await resolveBearerUserId(ctx.req.headers);
+  if (!authed) throw new FundingHttpError(401, "unauthorized", "Sign in required.");
+  const body = (ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
+    ? ctx.body : {}) as Record<string, unknown>;
+  const claimed = (typeof body.userId === "string" ? body.userId : null) || ctx.query.get("userId");
+  if (claimed && claimed !== authed) {
+    throw new FundingHttpError(403, "forbidden", "This request is for a different user.");
+  }
+  return authed;
 }
 
 function toHttpError(err: unknown, HttpError: FundingMountDeps["HttpError"]): Error {
@@ -1367,8 +1377,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   // --- POST /api/v1/funding/wallets — create (or fetch) a user's wallets ---
   route("POST", "/api/v1/funding/wallets", async (ctx) => {
     try {
-      const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx.query, body);
+      const userId = await requireUserId(ctx);
       const { record, created } = await getOrCreateUserWallets(userId);
       sendJson(ctx.res, created ? 201 : 200, {
         ...networkEnvelope(),
@@ -1389,7 +1398,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   // --- GET /api/v1/funding/deposit-address?userId=&chain= ---
   route("GET", "/api/v1/funding/deposit-address", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const defaultChain = resolveChain(ctx.query.get("chain")); // validate before any Circle call
       const currency = resolveCurrency(ctx.query.get("currency"), defaultChain);
       const { record } = await getOrCreateUserWallets(userId);
@@ -1428,7 +1437,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   // --- POST /api/v1/funding/transfer — sweep user wallet -> treasury ---
   route("GET", "/api/v1/funding/balances", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const { record } = await getOrCreateUserWallets(userId);
 
       const chains = await Promise.all(
@@ -1483,7 +1492,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   route("POST", "/api/v1/funding/transfer", async (ctx) => {
     try {
       const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx.query, body);
+      const userId = await requireUserId(ctx);
       const amount = body.amount;
       const chain = typeof body.chain === "string" ? body.chain : undefined;
       const currency = typeof body.currency === "string" ? body.currency : undefined;
@@ -1527,7 +1536,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   // --- GET /api/v1/funding/ledger?userId=&refresh=true ---
   route("GET", "/api/v1/funding/ledger", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const refresh = ctx.query.get("refresh") === "true";
       let entries = await dbListLedgerEntriesByUser(userId);
       if (refresh) {
@@ -1557,7 +1566,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   route("POST", "/api/v1/funding/deposit-address", async (ctx) => {
     try {
       const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx.query, body);
+      const userId = await requireUserId(ctx);
       const chain = resolveChain(
         typeof body.chain === "string" && body.chain ? body.chain : null
       );
@@ -1593,7 +1602,7 @@ export function mountFundingRoutes(deps: FundingMountDeps): void {
   // Deposits only (kind='deposit'); sweeps live under /api/v1/funding/ledger.
   route("GET", "/api/v1/funding/deposits", async (ctx) => {
     try {
-      const userId = requireUserId(ctx.query);
+      const userId = await requireUserId(ctx);
       const entries = (await dbListLedgerEntriesByUser(userId)).filter(
         (e) => e.kind === "deposit"
       );

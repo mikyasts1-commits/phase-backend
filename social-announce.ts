@@ -15,6 +15,7 @@
 
 import { randomBytes } from "node:crypto";
 import { decryptToken } from "./social-auth.js";
+import { resolveBearerUserId } from "./auth.js";
 
 // sharp is loaded lazily — if the native module fails on the deploy target,
 // card generation falls back to serving the raw SVG instead of crashing boot.
@@ -198,6 +199,22 @@ export function mountAnnounceRoutes(deps: RouteCtx, store?: AnnounceStore) {
   const { route, sendJson, HttpError } = deps;
   const db: AnnounceStore = store || new MemoryAnnounceStore();
 
+  // The userId for private routes ALWAYS comes from the authenticated Bearer
+  // session. A client-supplied userId in the body/query is never trusted: if
+  // one is present and disagrees with the session, the request is rejected.
+  const requireSessionUserId = async (ctx: { req: any; url: URL; body: unknown }): Promise<string> => {
+    const headers = (ctx.req?.headers ?? {}) as Record<string, string | string[] | undefined>;
+    const authed = await resolveBearerUserId(headers);
+    if (!authed) throw new HttpError(401, "unauthorized", "Sign in required.");
+    const body = (ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
+      ? ctx.body : {}) as Record<string, unknown>;
+    const claimed = (typeof body.userId === "string" ? body.userId : null) || ctx.url.searchParams.get("userId");
+    if (claimed && claimed !== authed) {
+      throw new HttpError(403, "forbidden", "This request is for a different user.");
+    }
+    return authed;
+  };
+
   // Serve generated launch cards (public URL for social APIs to pull from)
   route("GET", "/api/v1/social/cards/:cardId", async (ctx) => {
     // Strip any extension (.png / .svg) from the card id
@@ -222,11 +239,12 @@ export function mountAnnounceRoutes(deps: RouteCtx, store?: AnnounceStore) {
 
   // Announce a coin launch across all connected socials
   route("POST", "/api/v1/social/announce", async (ctx) => {
+    const userId = await requireSessionUserId(ctx);
     const body = (ctx.body || {}) as {
-      userId?: string; coinName?: string; ticker?: string; meme?: boolean; cardId?: string;
+      coinName?: string; ticker?: string; meme?: boolean; cardId?: string;
     };
-    if (!body.userId || !body.coinName || !body.ticker) {
-      throw new HttpError(400, "missing_fields", "userId, coinName, and ticker required");
+    if (!body.coinName || !body.ticker) {
+      throw new HttpError(400, "missing_fields", "coinName and ticker required");
     }
 
     // Generate or reuse the launch card
@@ -244,12 +262,12 @@ export function mountAnnounceRoutes(deps: RouteCtx, store?: AnnounceStore) {
       ? `I just launched $${body.ticker} (${body.coinName}) on Phase — no promises, just vibes. Everyone gets their own blockchain.`
       : `I just launched $${body.ticker} (${body.coinName}) on Phase — backed by a signed issuer covenant. Everyone gets their own blockchain.`;
 
-    const connections = await db.listConnections(body.userId);
+    const connections = await db.listConnections(userId);
     const results: Record<string, any> = {};
 
     await Promise.all(connections.map(async ({ provider }) => {
       try {
-        const tokens = await db.getConnectionTokens(body.userId!, provider);
+        const tokens = await db.getConnectionTokens(userId, provider);
         if (!tokens) {
           results[provider] = { ok: false, error: "no_tokens" };
           return;
@@ -271,7 +289,7 @@ export function mountAnnounceRoutes(deps: RouteCtx, store?: AnnounceStore) {
 
     await db.logAnnouncement({
       id: `ann_${randomBytes(8).toString("hex")}`,
-      userId: body.userId,
+      userId,
       coinName: body.coinName,
       ticker: body.ticker,
       cardId,

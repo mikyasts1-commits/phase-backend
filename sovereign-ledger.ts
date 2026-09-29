@@ -27,8 +27,10 @@ import {
   txMerkleLeaf,
   LedgerError,
 } from "./sovereign-ledger-core.js";
+import { resolveBearerUserId } from "./auth.js";
 
 interface LedgerCtx {
+  req: any;
   res: any;
   params: Record<string, string>;
   query: URLSearchParams;
@@ -44,7 +46,16 @@ interface LedgerDeps {
 const PREFIX = "/api/v1/sovereign";
 
 export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
-  const { route, sendJson } = deps;
+  const { route, sendJson, HttpError } = deps;
+
+  // All sovereign-ledger routes require a valid Bearer session. Identity
+  // always comes from the session, never from a client-supplied userId.
+  const requireSession = async (ctx: LedgerCtx): Promise<string> => {
+    const headers = (ctx.req?.headers ?? {}) as Record<string, string | string[] | undefined>;
+    const userId = await resolveBearerUserId(headers);
+    if (!userId) throw new HttpError(401, "unauthorized", "Sign in required.");
+    return userId;
+  };
 
   const fail = (ctx: LedgerCtx, err: unknown): void => {
     if (err instanceof LedgerError) {
@@ -58,6 +69,7 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   // POST /api/v1/ledger/chains — create a sovereign chain + genesis block
   route("POST", `${PREFIX}/chains`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const result = await createChain(ctx.body);
       sendJson(ctx.res, 201, result);
     } catch (err) {
@@ -66,8 +78,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains — list chains
-  route("GET", `${PREFIX}/chains`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const ticker = ctx.query.get("ticker");
       const status = ctx.query.get("status");
       const limit = Math.min(Number(ctx.query.get("limit")) || 50, 200);
@@ -86,8 +99,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id — get chain
-  route("GET", `${PREFIX}/chains/:id`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const chain = store.chains.get(ctx.params.id);
       if (!chain) return sendJson(ctx.res, 404, { error: "chain_not_found" });
       sendJson(ctx.res, 200, serializeChain(chain));
@@ -99,6 +113,7 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   // POST /api/v1/ledger/chains/:id/transactions — submit a signed transaction
   route("POST", `${PREFIX}/chains/:id/transactions`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const result = await submitTransaction(ctx.params.id, ctx.body);
       sendJson(ctx.res, result.status, result.body);
     } catch (err) {
@@ -107,8 +122,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id/transactions — list transactions
-  route("GET", `${PREFIX}/chains/:id/transactions`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id/transactions`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const chainId = ctx.params.id;
       if (!store.chains.has(chainId)) return sendJson(ctx.res, 404, { error: "chain_not_found" });
       const sender = ctx.query.get("sender");
@@ -125,8 +141,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id/transactions/:txId — get transaction
-  route("GET", `${PREFIX}/chains/:id/transactions/:txId`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id/transactions/:txId`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const tx: any = store.txById.get(ctx.params.txId);
       if (!tx || tx.chainId !== ctx.params.id) return sendJson(ctx.res, 404, { error: "transaction_not_found" });
       sendJson(ctx.res, 200, serializeTx(tx));
@@ -136,8 +153,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id/blocks/latest — latest block
-  route("GET", `${PREFIX}/chains/:id/blocks/latest`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id/blocks/latest`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const block = store.getLatestBlock(ctx.params.id);
       if (!block) return sendJson(ctx.res, 404, { error: "block_not_found" });
       sendJson(ctx.res, 200, serializeBlock(block));
@@ -147,8 +165,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id/blocks/:height — get block by height
-  route("GET", `${PREFIX}/chains/:id/blocks/:height`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id/blocks/:height`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const blocks = store.blocksByChain.get(ctx.params.id) || [];
       const block = blocks[Number(ctx.params.height)];
       if (!block) return sendJson(ctx.res, 404, { error: "block_not_found" });
@@ -159,8 +178,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id/balances/:address — balance
-  route("GET", `${PREFIX}/chains/:id/balances/:address`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id/balances/:address`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const chainId = ctx.params.id;
       if (!store.chains.has(chainId)) return sendJson(ctx.res, 404, { error: "chain_not_found" });
       const entry = store.getBalanceEntry(chainId, ctx.params.address);
@@ -177,8 +197,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id/proofs/balance/:address — Merkle balance proof
-  route("GET", `${PREFIX}/chains/:id/proofs/balance/:address`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id/proofs/balance/:address`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const chainId = ctx.params.id;
       const address = ctx.params.address;
       if (!store.chains.has(chainId)) return sendJson(ctx.res, 404, { error: "chain_not_found" });
@@ -213,8 +234,9 @@ export function mountSovereignLedgerRoutes(deps: LedgerDeps): void {
   });
 
   // GET /api/v1/ledger/chains/:id/proofs/transaction/:txId — Merkle tx proof
-  route("GET", `${PREFIX}/chains/:id/proofs/transaction/:txId`, (ctx: LedgerCtx) => {
+  route("GET", `${PREFIX}/chains/:id/proofs/transaction/:txId`, async (ctx: LedgerCtx) => {
     try {
+      await requireSession(ctx);
       const tx: any = store.txById.get(ctx.params.txId);
       if (!tx || tx.chainId !== ctx.params.id || tx.blockHeight === undefined) {
         return sendJson(ctx.res, 404, { error: "transaction_not_found_or_unconfirmed" });
