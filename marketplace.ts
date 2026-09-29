@@ -32,6 +32,7 @@ import {
   auditLog,
 } from "./sovereign-ledger-core.js";
 import { getIssuanceStore, type IssuanceCoin } from "./issuance.js";
+import { resolveBearerUserId } from "./auth.js";
 
 // ---------------------------------------------------------------------------
 // Types + helpers
@@ -479,11 +480,18 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
     sendJson(ctx.res, statusCode, { ...NETWORK_ENVELOPE, error: code, message });
   };
 
-  const requireUserId = (ctx: MarketplaceCtx): string => {
+  // The userId for private routes ALWAYS comes from the authenticated Bearer
+  // session. A client-supplied userId in the body/query is never trusted: if
+  // one is present and disagrees with the session, the request is rejected.
+  const requireUserId = async (ctx: MarketplaceCtx): Promise<string> => {
+    const authed = await resolveBearerUserId(ctx.req.headers);
+    if (!authed) throw new HttpError(401, "unauthorized", "Sign in required.");
     const body = asRecord(ctx.body);
-    const id = str(body.userId) || str(ctx.query.get("userId"));
-    if (!id) throw new HttpError(400, "missing_user_id", "Provide userId in the body or query string.");
-    return id;
+    const claimed = str(body.userId) || str(ctx.query.get("userId"));
+    if (claimed && claimed !== authed) {
+      throw new HttpError(403, "forbidden", "This request is for a different user.");
+    }
+    return authed;
   };
 
   const idempotencyKey = (ctx: MarketplaceCtx, fallback: string): string => {
@@ -505,7 +513,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         throw new HttpError(429, "rate_limited", "Too many buy attempts — wait a minute and try again.");
       }
       const body = asRecord(ctx.body);
-      const buyerUserId = requireUserId(ctx);
+      const buyerUserId = await requireUserId(ctx);
       const chainId = str(body.chainId);
       if (!chainId) throw new HttpError(400, "missing_chain_id", "Body must include chainId.");
       const buyerAddress = str(body.buyerAddress);
@@ -737,7 +745,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         throw new HttpError(429, "rate_limited", "Too many swap attempts — wait a minute and try again.");
       }
       const body = asRecord(ctx.body);
-      const buyerUserId = requireUserId(ctx);
+      const buyerUserId = await requireUserId(ctx);
       const chainId = str(body.chainId);
       if (!chainId) throw new HttpError(400, "missing_chain_id", "Body must include chainId (the target coin's chain).");
       const buyerAddress = str(body.buyerAddress);
@@ -935,7 +943,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
   // --- GET /api/v1/trades/balances?userId= ---
   route("GET", "/api/v1/trades/balances", async (ctx) => {
     try {
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const ms = await getStoreAsync();
       const [usd, earned] = await Promise.all([
         ms.getBalance(userId, USD),
@@ -952,7 +960,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
   // --- GET /api/v1/trades/history?userId=&role=seller|buyer ---
   route("GET", "/api/v1/trades/history", async (ctx) => {
     try {
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const role = ctx.query.get("role") === "buyer" ? "buyer" : "seller";
       const ms = await getStoreAsync();
       const trades = await ms.listTrades(userId, role);
@@ -969,7 +977,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         throw new HttpError(429, "rate_limited", "Too many top-up requests — wait a minute and try again.");
       }
       const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const amountUsd = parsePositiveMoney(body.amountUsd, "amountUsd", 100_000);
       const ms = await getStoreAsync();
       await ms.credit(userId, USD, money6(amountUsd));

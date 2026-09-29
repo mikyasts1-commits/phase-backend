@@ -14,6 +14,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createChain, LedgerError } from "./sovereign-ledger-core.js";
 import { getPool } from "./db.js";
+import { resolveBearerUserId } from "./auth.js";
 
 // ---------------------------------------------------------------------------
 // Canonical issuer agreement text.
@@ -531,11 +532,18 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
     sendJson(ctx.res, statusCode, { ...NETWORK_ENVELOPE, error: code, message });
   };
 
-  const requireUserId = (ctx: IssuanceCtx): string => {
+  // The userId for private routes ALWAYS comes from the authenticated Bearer
+  // session. A client-supplied userId in the body/query is never trusted: if
+  // one is present and disagrees with the session, the request is rejected.
+  const requireUserId = async (ctx: IssuanceCtx): Promise<string> => {
+    const authed = await resolveBearerUserId(ctx.req.headers);
+    if (!authed) throw new HttpError(401, "unauthorized", "Sign in required.");
     const body = asRecord(ctx.body);
-    const id = str(body.userId) || str(ctx.query.get("userId"));
-    if (!id) throw new HttpError(400, "missing_user_id", "Provide userId in the body or query string.");
-    return id;
+    const claimed = str(body.userId) || str(ctx.query.get("userId"));
+    if (claimed && claimed !== authed) {
+      throw new HttpError(403, "forbidden", "This request is for a different user.");
+    }
+    return authed;
   };
 
   const idempotencyKey = (ctx: IssuanceCtx): string => {
@@ -554,7 +562,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
   route("POST", "/api/v1/issuance/draft", async (ctx) => {
     try {
       const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const name = str(body.name).trim();
       if (name.length < 1 || name.length > 60) {
         throw new HttpError(422, "invalid_name", "name must be 1-60 characters");
@@ -620,7 +628,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
   route("POST", "/api/v1/issuance/sign", async (ctx) => {
     try {
       const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const draftId = str(body.draftId);
       if (!draftId) throw new HttpError(400, "missing_draft_id", "Body must include draftId.");
       const legalName = str(body.legalName).trim();
@@ -670,7 +678,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
   route("POST", "/api/v1/issuance/mint", async (ctx) => {
     try {
       const body = asRecord(ctx.body);
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const draftId = str(body.draftId);
       if (!draftId) throw new HttpError(400, "missing_draft_id", "Body must include draftId.");
       const isMeme = body.meme === true;
@@ -764,7 +772,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
   // --- GET /api/v1/issuance/coins?userId= ---
   route("GET", "/api/v1/issuance/coins", async (ctx) => {
     try {
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const _st2 = await store();
       const coins = await _st2.listCoinsByUser(userId);
       sendJson(ctx.res, 200, { ...NETWORK_ENVELOPE, userId, coins });
@@ -774,7 +782,7 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
   // --- GET /api/v1/issuance/coins/:id ---
   route("GET", "/api/v1/issuance/coins/:id", async (ctx) => {
     try {
-      const userId = requireUserId(ctx);
+      const userId = await requireUserId(ctx);
       const _st2 = await store();
       const coins = await _st2.listCoinsByUser(userId);
       const coin = coins.find((c) => c.id === ctx.params.id || c.mintAddress === ctx.params.id);

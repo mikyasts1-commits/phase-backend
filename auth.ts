@@ -227,6 +227,23 @@ function bearerToken(ctx: AuthCtx): string | null {
   return h.slice("Bearer ".length).trim() || null;
 }
 
+// Shared session resolver for other route modules (issuance, marketplace).
+// Returns the authenticated userId for a valid Bearer token, or null when the
+// token is missing, malformed, expired, or unknown. Private routes must derive
+// the userId from this — never from a client-supplied body/query value.
+export async function resolveBearerUserId(
+  headers: Record<string, string | string[] | undefined>
+): Promise<string | null> {
+  const header = headers["authorization"];
+  const h = Array.isArray(header) ? header[0] : header;
+  if (!h || !h.startsWith("Bearer ")) return null;
+  const token = h.slice("Bearer ".length).trim();
+  if (!token) return null;
+  const s = await store();
+  const session = await s.getSession(token);
+  return session ? session.userId : null;
+}
+
 export function mountAuthRoutes(deps: AuthMountDeps): void {
   const { route, sendJson } = deps;
   const HttpError = deps.HttpError;
