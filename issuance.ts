@@ -87,6 +87,12 @@ export interface IssuanceCoin {
    *  allocation and the swap-offer destination live here. Null for coins
    *  minted before this column existed. */
   issuerAddress: string | null;
+  /** Coin category from the draft (frozen at mint). Null for older coins. */
+  category: string | null;
+  /** Total shares minted (frozen at mint). Null for older coins. */
+  totalShares: number | null;
+  /** Shares retained by the issuer = totalShares * draft.equityRetained / 100. */
+  retainedShares: number | null;
   network: "sovereign";
   idempotencyKey: string;
   createdAt: string;
@@ -289,12 +295,14 @@ class PgIssuanceStore implements IssuanceStore {
     const rows = await this.q<IssuanceCoin>(
       `INSERT INTO issuance_coins
          (id, draft_id, user_id, signature_id, is_meme, name, ticker,
-          mint_address, tx_signature, supply, decimals, price_usd, issuer_address, network, idempotency_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'sovereign',$14)
+          mint_address, tx_signature, supply, decimals, price_usd, issuer_address,
+          category, total_shares, retained_shares, network, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'sovereign',$17)
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING ${COIN_COLS}`,
       [id, c.draftId, c.userId, c.signatureId, c.isMeme, c.name, c.ticker,
-       c.mintAddress, c.txSignature, c.supply, c.decimals, c.priceUsd, c.issuerAddress ?? null, c.idempotencyKey]
+       c.mintAddress, c.txSignature, c.supply, c.decimals, c.priceUsd, c.issuerAddress ?? null,
+       c.category ?? null, c.totalShares ?? null, c.retainedShares ?? null, c.idempotencyKey]
     );
     // Lost the race: another request with the same key already stored a coin.
     const existing = await this.getCoinByIdempotency(c.idempotencyKey);
@@ -320,6 +328,7 @@ const COIN_COLS = `id, draft_id AS "draftId", user_id AS "userId",
   signature_id AS "signatureId", is_meme AS "isMeme", name, ticker,
   mint_address AS "mintAddress", tx_signature AS "txSignature",
   supply, decimals, price_usd AS "priceUsd", issuer_address AS "issuerAddress",
+  category, total_shares AS "totalShares", retained_shares AS "retainedShares",
   network, idempotency_key AS "idempotencyKey",
   created_at AS "createdAt"`;
 
@@ -725,6 +734,9 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
         decimals: 6,
         priceUsd: draft.priceUsd,
         issuerAddress,
+        category: draft.category || null,
+        totalShares,
+        retainedShares: Math.round((totalShares * draft.equityRetained) / 100),
         idempotencyKey: key,
       });
       await s.setDraftStatus(draftId, "minted");
