@@ -62,6 +62,7 @@ import { mountIssuanceRoutes } from "./issuance.js";
 import { mountAuthRoutes, resolveBearerUserId } from "./auth.js";
 import { mountSovereignLedgerRoutes } from "./sovereign-ledger.js";
 import { mountMarketplaceRoutes } from "./marketplace.js";
+import { mountAdminRoutes } from "./admin.js";
 import { mountLegalDocsRoutes } from "./legal-docs.js";
 import { mountSocialRoutes } from "./social-auth.js";
 import { mountAnnounceRoutes } from "./social-announce.js";
@@ -1111,6 +1112,11 @@ mountSovereignLedgerRoutes({ route, sendJson, HttpError });
 // Test rails only (topup is a test-mode faucet).
 mountMarketplaceRoutes({ route, sendJson, HttpError });
 
+// --- 8e-vii-a. Admin API: fee config, treasury, withdrawals, reconciliation
+// (see admin.ts). Admin-only endpoints; bootstrap via PHASE_ADMIN_EMAILS or
+// the is_admin flag.
+mountAdminRoutes({ route, sendJson, HttpError });
+
 // --- 8e-viia. Legal documents (see legal-docs.ts) ---
 // The completed Phase Coin Minting Agreement (base PDF) plus per-signature
 // auto-populated copies (Article 20 block filled from the signature record).
@@ -1124,6 +1130,42 @@ import("./marketplace.js").then((m) => {
       console.error("[boot] settlement reconciliation failed:", e));
   }
 }).catch((e) => console.error("[boot] marketplace import failed:", e));
+
+// --- 8e-viii-a. Fee engine: production preflight + daily reconciliation ---
+// Production checks log loudly; they only block boot when
+// PHASE_REQUIRE_PRODUCTION_CHECKS=true. The daily fee reconciliation runs
+// once at boot (catch-up if the last run is >20h old) and every 24h after.
+import("./fee.js").then(async (fee) => {
+  try {
+    await fee.assertProductionReady();
+  } catch (e) {
+    console.error("[boot] production preflight failed:", (e as Error).message);
+    throw e;
+  }
+  const runDaily = async () => {
+    try {
+      const result = await fee.runFeeReconciliation(1);
+      if (!result.invariantOk) {
+        console.error(
+          `[reconciliation] DISCREPANCIES in run ${result.runId} — recorded, never auto-repaired. ` +
+          `Review reconciliation_runs before any further withdrawals.`);
+      } else {
+        console.log(`[reconciliation] daily run ${result.runId} ok (${result.assets.length} asset(s))`);
+      }
+    } catch (e) {
+      console.error("[reconciliation] daily run failed:", (e as Error).message);
+    }
+  };
+  try {
+    const latest = await fee.latestReconciliation();
+    const stale = !latest || Date.now() - new Date(latest.ranAt).getTime() > 20 * 3600_000;
+    if (stale) await runDaily();
+    else console.log(`[reconciliation] last run ${latest.id} at ${latest.ranAt}; next in ~24h`);
+  } catch (e) {
+    console.error("[reconciliation] catch-up check failed:", (e as Error).message);
+  }
+  setInterval(runDaily, 24 * 3600_000);
+}).catch((e) => console.error("[boot] fee engine init failed:", e));
 
 // --- 8f. Ledger introspection (debug/demo aid — see the simulated chain) ---
 route("GET", "/api/v1/ledger/blocks", async (ctx) => {

@@ -31,6 +31,26 @@ import {
 import { getIssuanceStore, type IssuanceCoin } from "./issuance.js";
 import { resolveBearerUserId } from "./auth.js";
 import { checkRateLimit as sharedCheckRateLimit, clientIpFromHeaders } from "./rate-limit.js";
+import {
+  getFeeConfig,
+  toMicroUnits,
+  fromMicroUnits,
+  coinUnitsToDecimal,
+  decimalToCoinUnits,
+  recordFee,
+  getFeeByIdempotencyKey,
+  setFeeTransactionId,
+  markFeeReversed,
+  markFeeSettled,
+  feeIdempotencyKey,
+  getTreasuryAccountId,
+  ensureTreasuryAccount,
+  creditTreasury,
+  debitTreasury,
+  getTreasurySovereignAddress,
+  requireTreasurySovereignAddress,
+  FEE_DISCLOSURE,
+} from "./fee.js";
 
 // ---------------------------------------------------------------------------
 // Types + helpers
@@ -70,6 +90,12 @@ export interface MarketTrade {
   offerCoinId: string | null;
   offerUnits: string | null; // human units, 6dp
   offerTxId: string | null;
+  /** 80-bps fee actually applied (null until the fee leg settles). */
+  feeBps: number | null;
+  /** Fee in settlement-asset units, 6dp text (USD for buys, whole coins for swaps). */
+  feeAmount: string | null;
+  /** Net settlement to the proceeds recipient, 6dp text. */
+  netAmount: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +134,12 @@ export interface SettlementAttempt {
   offerTxId: string | null;
   /** Swap target: the target coin issuer's sovereign address (null for buys). */
   sellerAddress: string | null;
+  /** Swap coin-fee tracking: fee in whole target-coin units (null for buys). */
+  feeUnits: string | null;
+  /** Fee basis points recorded on the attempt (null until computed). */
+  feeBps: number | null;
+  /** On-chain tx id of the float -> treasury fee transfer (swaps). */
+  feeTxId: string | null;
 }
 
 const TERMINAL_STATES: SettlementState[] = ["coin_confirmed", "failed", "compensated"];
@@ -121,7 +153,8 @@ const ATTEMPT_COLS = `id, idempotency_key AS "idempotencyKey", kind,
   error_code AS "errorCode",
   offer_chain_id AS "offerChainId", offer_coin_id AS "offerCoinId",
   offer_units AS "offerUnits", offer_tx_id AS "offerTxId",
-  seller_address AS "sellerAddress"`;
+  seller_address AS "sellerAddress",
+  fee_units AS "feeUnits", fee_bps AS "feeBps", fee_tx_id AS "feeTxId"`;
 
 const NETWORK_ENVELOPE = { network: "sovereign" as const, chain: "phase" as const };
 const USD = "USD";
@@ -137,12 +170,33 @@ function str(v: unknown): string {
 function money6(n: number): string {
   return n.toFixed(6);
 }
-function parsePositiveMoney(raw: unknown, field: string, max = 1_000_000_000): number {
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0 || n > max) {
+
+/**
+ * Exact integer parsing for authoritative money math. Parses the raw input
+ * directly to BigInt microunits — no floating point at any step. Rejects
+ * non-numeric, non-positive, and over-limit values.
+ */
+function parsePositiveMicroUnits(raw: unknown, field: string, maxMicro = 1_000_000_000_000000n): bigint {
+  const s = typeof raw === "number" ? String(raw) : typeof raw === "string" ? raw.trim() : "";
+  let v: bigint;
+  try {
+    v = toMicroUnits(s);
+  } catch {
     throw new MarketplaceHttpError(422, "invalid_amount", `${field} must be a positive number.`);
   }
-  return Math.round(n * 1e6) / 1e6; // normalize to 6dp
+  if (v <= 0n || v > maxMicro) {
+    throw new MarketplaceHttpError(422, "invalid_amount", `${field} must be a positive number.`);
+  }
+  return v;
+}
+
+/** Whole coin units from user input (fractional input is floored; < 1 rejected). */
+function parseWholeCoinUnits(raw: unknown, field: string): bigint {
+  const units = parsePositiveMicroUnits(raw, field) / 1_000_000n;
+  if (units < 1n) {
+    throw new MarketplaceHttpError(422, "amount_too_small", `${field} must be at least one whole coin.`);
+  }
+  return units;
 }
 
 class MarketplaceHttpError extends Error {
@@ -161,13 +215,13 @@ interface MarketStore {
   transfer(userIdFrom: string, userIdTo: string, currency: string, amount: string): Promise<void>;
   credit(userId: string, currency: string, amount: string): Promise<void>;
   getTradeByIdempotency(key: string): Promise<MarketTrade | null>;
-  recordTrade(t: Omit<MarketTrade, "id" | "createdAt">): Promise<MarketTrade>;
+  recordTrade(t: Omit<MarketTrade, "id" | "createdAt" | "feeBps" | "feeAmount" | "netAmount">): Promise<MarketTrade>;
   listTrades(userId: string, role: "buyer" | "seller"): Promise<MarketTrade[]>;
   lifetimeSalesUsd(sellerUserId: string): Promise<string>;
   // --- durable settlement attempts ---
   createAttempt(a: Omit<SettlementAttempt, "id" | "state" | "coinTxId" | "tradeId" | "errorCode">): Promise<{ attempt: SettlementAttempt; created: boolean }>;
   getAttemptByIdempotency(key: string): Promise<SettlementAttempt | null>;
-  setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string; offerTxId?: string; sellerAddress?: string }): Promise<void>;
+  setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string; offerTxId?: string; sellerAddress?: string; feeTxId?: string }): Promise<void>;
   listOpenAttempts(): Promise<SettlementAttempt[]>;
 }
 
@@ -229,23 +283,41 @@ class PgMarketStore implements MarketStore {
     return rows[0] ?? null;
   }
 
-  async recordTrade(t: Omit<MarketTrade, "id" | "createdAt">): Promise<MarketTrade> {
+  async recordTrade(t: Omit<MarketTrade, "id" | "createdAt" | "feeBps" | "feeAmount" | "netAmount">): Promise<MarketTrade> {
     const id = randomUUID();
+    // Attach the authoritative fee record (written during the fee leg) so
+    // every trade row carries gross/fee/net for history display.
+    const feeKey = feeIdempotencyKey(t.kind === "swap" ? "swap" : "buy", t.idempotencyKey);
+    const feeRows = await this.q<{ fee_bps: number; fee_quantity: string; net_quantity: string }>(
+      `SELECT fee_bps, fee_quantity::text AS fee_quantity, net_quantity::text AS net_quantity
+       FROM fee_ledger WHERE idempotency_key = $1`,
+      [feeKey]
+    );
+    const feeBps = feeRows[0]?.fee_bps ?? null;
+    const feeAmount = feeRows[0]?.fee_quantity ?? null;
+    const netAmount = feeRows[0]?.net_quantity ?? null;
     const rows = await this.q<MarketTrade>(
       `INSERT INTO market_trades
          (id, chain_id, coin_id, buyer_user_id, seller_user_id, units, price_usd,
           amount_usd, buyer_address, tx_id, idempotency_key,
-          kind, offer_chain_id, offer_coin_id, offer_units, offer_tx_id)
+          kind, offer_chain_id, offer_coin_id, offer_units, offer_tx_id,
+          fee_bps, fee_amount, net_amount)
        VALUES ($1,$2,$3,$4,$5,$6::numeric,$7::numeric,$8::numeric,$9,$10,$11,
-               $12,$13,$14,$15,$16)
+               $12,$13,$14,$15,$16,$17,$18,$19)
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING ${TRADE_COLS}`,
       [id, t.chainId, t.coinId, t.buyerUserId, t.sellerUserId, t.units, t.priceUsd,
        t.amountUsd, t.buyerAddress, t.txId, t.idempotencyKey,
        t.kind ?? "buy", t.offerChainId ?? null, t.offerCoinId ?? null,
-       t.offerUnits ?? null, t.offerTxId ?? null]
+       t.offerUnits ?? null, t.offerTxId ?? null,
+       feeBps, feeAmount, netAmount]
     );
-    if (rows[0]) return rows[0];
+    if (rows[0]) {
+      // Link the fee record to its trade (idempotent; harmless on replay).
+      await this.q(`UPDATE fee_ledger SET transaction_id = $1 WHERE idempotency_key = $2`,
+        [id, feeKey]);
+      return rows[0];
+    }
     const existing = await this.getTradeByIdempotency(t.idempotencyKey);
     if (!existing) throw new Error("idempotency conflict without existing trade");
     return existing;
@@ -273,15 +345,17 @@ class PgMarketStore implements MarketStore {
       `INSERT INTO settlement_attempts
          (id, idempotency_key, kind, chain_id, coin_id, buyer_user_id, seller_user_id,
           buyer_address, units, price_usd, amount_usd, state,
-          offer_chain_id, offer_coin_id, offer_units, offer_tx_id, seller_address)
+          offer_chain_id, offer_coin_id, offer_units, offer_tx_id, seller_address,
+          fee_units, fee_bps, fee_tx_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::numeric,$10::numeric,$11::numeric,'started',
-               $12,$13,$14,$15,$16)
+               $12,$13,$14,$15,$16,$17,$18,$19)
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING ${ATTEMPT_COLS}`,
       [id, a.idempotencyKey, a.kind ?? "buy", a.chainId, a.coinId, a.buyerUserId, a.sellerUserId,
        a.buyerAddress, a.units, a.priceUsd, a.amountUsd,
        a.offerChainId ?? null, a.offerCoinId ?? null, a.offerUnits ?? null,
-       a.offerTxId ?? null, a.sellerAddress ?? null]
+       a.offerTxId ?? null, a.sellerAddress ?? null,
+       a.feeUnits ?? null, a.feeBps ?? null, a.feeTxId ?? null]
     );
     if (rows[0]) return { attempt: rows[0], created: true };
     const existing = await this.getAttemptByIdempotency(a.idempotencyKey);
@@ -295,7 +369,7 @@ class PgMarketStore implements MarketStore {
     return rows[0] ?? null;
   }
 
-  async setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string; offerTxId?: string; sellerAddress?: string }): Promise<void> {
+  async setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string; offerTxId?: string; sellerAddress?: string; feeTxId?: string }): Promise<void> {
     await this.q(
       `UPDATE settlement_attempts SET state = $2,
          coin_tx_id = COALESCE($3, coin_tx_id),
@@ -303,10 +377,11 @@ class PgMarketStore implements MarketStore {
          error_code = COALESCE($5, error_code),
          offer_tx_id = COALESCE($6, offer_tx_id),
          seller_address = COALESCE($7, seller_address),
+         fee_tx_id = COALESCE($8, fee_tx_id),
          updated_at = now()
        WHERE id = $1`,
       [id, state, patch?.coinTxId ?? null, patch?.tradeId ?? null, patch?.errorCode ?? null,
-       patch?.offerTxId ?? null, patch?.sellerAddress ?? null]
+       patch?.offerTxId ?? null, patch?.sellerAddress ?? null, patch?.feeTxId ?? null]
     );
   }
 
@@ -325,7 +400,8 @@ const TRADE_COLS = `id, chain_id AS "chainId", coin_id AS "coinId",
   idempotency_key AS "idempotencyKey", created_at AS "createdAt",
   kind,
   offer_chain_id AS "offerChainId", offer_coin_id AS "offerCoinId",
-  offer_units AS "offerUnits", offer_tx_id AS "offerTxId"`;
+  offer_units AS "offerUnits", offer_tx_id AS "offerTxId",
+  fee_bps AS "feeBps", fee_amount AS "feeAmount", net_amount AS "netAmount"`;
 
 class MemoryMarketStore implements MarketStore {
   private balances = new Map<string, string>(); // `${userId}:${currency}` -> decimal string
@@ -358,10 +434,10 @@ class MemoryMarketStore implements MarketStore {
   async getTradeByIdempotency(key: string): Promise<MarketTrade | null> {
     return this.tradesByKey.get(key) ?? null;
   }
-  async recordTrade(t: Omit<MarketTrade, "id" | "createdAt">): Promise<MarketTrade> {
+  async recordTrade(t: Omit<MarketTrade, "id" | "createdAt" | "feeBps" | "feeAmount" | "netAmount">): Promise<MarketTrade> {
     const existing = this.tradesByKey.get(t.idempotencyKey);
     if (existing) return existing;
-    const trade: MarketTrade = { ...t, id: randomUUID(), createdAt: new Date().toISOString() };
+    const trade: MarketTrade = { ...t, feeBps: null, feeAmount: null, netAmount: null, id: randomUUID(), createdAt: new Date().toISOString() };
     this.trades.set(trade.id, trade);
     this.tradesByKey.set(trade.idempotencyKey, trade);
     return trade;
@@ -398,7 +474,7 @@ class MemoryMarketStore implements MarketStore {
     return this.attemptsByKey.get(key) ?? null;
   }
 
-  async setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string; offerTxId?: string; sellerAddress?: string }): Promise<void> {
+  async setAttemptState(id: string, state: SettlementState, patch?: { coinTxId?: string; tradeId?: string; errorCode?: string; offerTxId?: string; sellerAddress?: string; feeTxId?: string }): Promise<void> {
     const a = this.attempts.get(id);
     if (!a) return;
     a.state = state;
@@ -407,6 +483,7 @@ class MemoryMarketStore implements MarketStore {
     if (patch?.errorCode) a.errorCode = patch.errorCode;
     if (patch?.offerTxId) a.offerTxId = patch.offerTxId;
     if (patch?.sellerAddress) a.sellerAddress = patch.sellerAddress;
+    if (patch?.feeTxId) a.feeTxId = patch.feeTxId;
   }
 
   async listOpenAttempts(): Promise<SettlementAttempt[]> {
@@ -429,6 +506,271 @@ async function getStoreAsync(): Promise<MarketStore> {
     storeInstance = new MemoryMarketStore();
   }
   return storeInstance;
+}
+
+// ---------------------------------------------------------------------------
+// 80-bps fee settlement — atomic and idempotent.
+//
+// CORRECTED buy model: fees are denominated in the PURCHASED ASSET.
+//   money leg (Postgres, one transaction):
+//     insert fee_ledger row (pending; idempotency guard) ->
+//     debit buyer USD (gross) -> credit seller USD (gross, IN FULL)
+//   coin leg (sovereign chain, crash-safe):
+//     float -> buyer (net units = gross - fee)
+//     float -> Phase treasury sovereign address (fee units)
+//   fee collection (Postgres, one transaction):
+//     mark fee row settled + credit treasury_balances (ticker, fee units)
+//
+// The seller's USD proceeds are NEVER fee-deducted. The buyer pays the
+// quoted gross USD and receives net purchased-asset units.
+// ---------------------------------------------------------------------------
+
+export interface BuyFeeSettlement {
+  buyerUserId: string;
+  sellerUserId: string;
+  /** Total the buyer pays (6dp USD). */
+  grossUsd: string;
+  /** Gross purchased-asset units (whole coins). */
+  grossUnits: bigint;
+  /** Phase fee in purchased-asset units (whole coins). */
+  feeUnits: bigint;
+  /** Buyer net units = grossUnits - feeUnits (whole coins). */
+  netUnits: bigint;
+  feeBps: number;
+  /** Fee idempotency key — guards the whole money leg. */
+  feeKey: string;
+  coinId: string | null;
+  /** Purchased-asset ticker (the fee denomination). */
+  ticker: string;
+}
+
+/**
+ * Atomic buy money leg with the 80-bps fee, in ONE Postgres transaction:
+ *   insert fee row (pending) -> debit buyer USD (gross) ->
+ *   credit seller USD (gross, in full — no fee deducted from proceeds)
+ *
+ * The fee itself is coin-denominated and is only collected on-chain in the
+ * coin leg; the fee row stays 'pending' until then. There is no USD fee
+ * split: the seller receives the full gross proceeds.
+ *
+ * Idempotent: the fee row is inserted FIRST under its idempotency key; a
+ * retry after a crash between COMMIT and the attempt-state update sees the
+ * existing row and returns { replayed: true } WITHOUT moving cash twice.
+ * This also closes the pre-existing double-debit hazard on money-leg retry.
+ */
+export async function settleBuyCashWithFee(s: BuyFeeSettlement): Promise<{ replayed: boolean }> {
+  const treasuryId = getTreasuryAccountId();
+  if (s.grossUnits < 0n || s.feeUnits < 0n || s.netUnits !== s.grossUnits - s.feeUnits) {
+    throw new Error("buy_fee_math_mismatch");
+  }
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    // Treasury account row must exist before the balance-sheet FK can
+    // reference it — inside this transaction, not on a separate connection.
+    await ensureTreasuryAccount(treasuryId, client);
+    const { created } = await recordFee(client, {
+      idempotencyKey: s.feeKey,
+      transactionId: null,
+      transactionType: "marketplace_buy",
+      userId: s.buyerUserId, // fee payer = buyer (deducted from received coins)
+      assetId: s.coinId,
+      assetSymbol: s.ticker,
+      grossQuantity: coinUnitsToDecimal(s.grossUnits),
+      feeBps: s.feeBps,
+      feeQuantity: coinUnitsToDecimal(s.feeUnits),
+      netQuantity: coinUnitsToDecimal(s.netUnits),
+      treasuryAccountId: treasuryId,
+      status: "pending",
+    });
+    if (!created) {
+      // This money leg already settled — do not move cash again.
+      await client.query("ROLLBACK");
+      return { replayed: true };
+    }
+    const debit = await client.query(
+      `UPDATE market_balances SET balance = balance - $1::numeric, updated_at = now()
+       WHERE user_id = $2 AND currency = 'USD' AND balance >= $1::numeric`,
+      [s.grossUsd, s.buyerUserId]
+    );
+    if (debit.rowCount === 0) {
+      throw new MarketplaceHttpError(402, "insufficient_funds",
+        "Not enough USD in your cash account. Insufficient balance. Add funds to continue.");
+    }
+    // Seller proceeds: the FULL gross. The Phase fee is collected in the
+    // purchased asset, never deducted from seller proceeds.
+    await client.query(
+      `INSERT INTO market_balances (user_id, currency, balance)
+       VALUES ($1, 'USD', $2::numeric)
+       ON CONFLICT (user_id, currency)
+       DO UPDATE SET balance = market_balances.balance + EXCLUDED.balance, updated_at = now()`,
+      [s.sellerUserId, s.grossUsd]
+    );
+    await client.query("COMMIT");
+    return { replayed: false };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export interface BuyFeeCollection {
+  feeKey: string;
+  /** Purchased-asset ticker (the fee denomination). */
+  ticker: string;
+  /** Fee units collected on-chain (whole coins). */
+  feeUnits: bigint;
+  /** On-chain tx id of the float -> treasury fee transfer (null when fee is 0). */
+  feeTxId: string | null;
+}
+
+/**
+ * Record the on-chain fee collection after the buy coin leg completes:
+ * mark the fee row settled and credit the treasury balance sheet
+ * (ticker, fee units) — atomically. Idempotent on the fee key.
+ */
+export async function recordBuyFeeSettlement(c: BuyFeeCollection): Promise<void> {
+  const treasuryId = getTreasuryAccountId();
+  if (c.feeUnits < 0n) throw new Error("negative_fee_units");
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    await ensureTreasuryAccount(treasuryId, client);
+    // Only credit the treasury when this call actually transitioned the
+    // fee pending -> settled. Retries on an already-settled fee are safe
+    // no-ops (never double-credit).
+    const transitioned = await markFeeSettled(client, c.feeKey, c.feeTxId);
+    if (transitioned && c.feeUnits > 0n) {
+      await creditTreasury(client, treasuryId, c.ticker, coinUnitsToDecimal(c.feeUnits));
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export interface BuyFeeCompensation {
+  sellerUserId: string;
+  buyerUserId: string;
+  /** Full gross USD the seller received (and must return). */
+  grossUsd: string;
+  feeKey: string;
+  reason: string;
+}
+
+/**
+ * Best-effort unwind of the buy money leg (coin leg failed after cash moved):
+ *   seller -> buyer (gross USD), fee marked reversed — atomically, or not at
+ *   all. The coin-denominated fee was never collected on-chain in the normal
+ *   path (its transfer runs inside the failed coin leg), so no treasury
+ *   movement is needed; the defensive 'settled' branch claws back the
+ *   balance-sheet credit if one ever exists.
+ * Never throws: callers log and continue with the original error, matching
+ * the pre-existing compensation behavior.
+ */
+export async function compensateBuyCashWithFee(c: BuyFeeCompensation): Promise<void> {
+  const treasuryId = getTreasuryAccountId();
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const feeRows = await client.query(
+      `SELECT status, fee_quantity::text AS "feeQuantity", asset_symbol AS "assetSymbol"
+       FROM fee_ledger WHERE idempotency_key = $1`, [c.feeKey]);
+    const feeRow = feeRows.rows[0] as
+      | { status: string; feeQuantity: string; assetSymbol: string } | undefined;
+    if (!feeRow || (feeRow.status !== "pending" && feeRow.status !== "settled")) {
+      await client.query("ROLLBACK");
+      return; // nothing (or already reversed/failed) — do not double-compensate
+    }
+    const sellerDebit = await client.query(
+      `UPDATE market_balances SET balance = balance - $1::numeric, updated_at = now()
+       WHERE user_id = $2 AND currency = 'USD' AND balance >= $1::numeric`,
+      [c.grossUsd, c.sellerUserId]
+    );
+    if (sellerDebit.rowCount === 0) throw new Error("seller_balance_insufficient_for_compensation");
+    await client.query(
+      `INSERT INTO market_balances (user_id, currency, balance)
+       VALUES ($1, 'USD', $2::numeric)
+       ON CONFLICT (user_id, currency)
+       DO UPDATE SET balance = market_balances.balance + EXCLUDED.balance, updated_at = now()`,
+      [c.buyerUserId, c.grossUsd]
+    );
+    if (feeRow.status === "settled") {
+      // Defensive: a settled fee means the fee was collected on-chain before
+      // the failure — claw back the balance-sheet credit. (The on-chain
+      // units themselves are reversed by the caller's coin-leg compensation.)
+      await debitTreasury(client, treasuryId, feeRow.assetSymbol, feeRow.feeQuantity);
+      await markFeeReversed(client, c.feeKey, c.reason);
+    } else {
+      // Pending: the fee never left the float — void the row.
+      await client.query(
+        `UPDATE fee_ledger
+         SET status = 'reversed', reversed_at = now(), reversal_reason = $2
+         WHERE idempotency_key = $1 AND status = 'pending'`,
+        [c.feeKey, c.reason]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("[marketplace] fee compensation failed:", (err as Error).message);
+    await auditLog("system", "fee_compensation_failed", "fee", c.feeKey,
+      { reason: c.reason, error: (err as Error).message });
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Record a swap fee (coin-denominated) after the on-chain fee transfer.
+ * Idempotent on the fee key; credits the treasury balance sheet.
+ */
+export async function recordSwapFee(input: {
+  feeKey: string;
+  buyerUserId: string;
+  coinId: string | null;
+  assetSymbol: string;
+  grossUnits: string;
+  feeBps: number;
+  feeUnits: string;
+  netUnits: string;
+  feeTxId: string | null;
+}): Promise<void> {
+  const treasuryId = getTreasuryAccountId();
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    await ensureTreasuryAccount(treasuryId, client);
+    const { created } = await recordFee(client, {
+      idempotencyKey: input.feeKey,
+      transactionId: null,
+      transactionType: "marketplace_swap",
+      userId: input.buyerUserId, // fee payer = buyer (deducted from received coins)
+      assetId: input.coinId,
+      assetSymbol: input.assetSymbol,
+      grossQuantity: input.grossUnits,
+      feeBps: input.feeBps,
+      feeQuantity: input.feeUnits,
+      netQuantity: input.netUnits,
+      treasuryAccountId: treasuryId,
+      coinTxId: input.feeTxId,
+      status: "settled",
+    });
+    if (created && toMicroUnits(input.feeUnits) > 0n) {
+      await creditTreasury(client, treasuryId, input.assetSymbol, input.feeUnits);
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +844,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       if (!isValidAddress(buyerAddress)) {
         throw new HttpError(422, "invalid_buyer_address", "buyerAddress must be a valid ph1 address.");
       }
-      const amountUsd = parsePositiveMoney(body.amountUsd, "amountUsd");
+      const amountMicro = parsePositiveMicroUnits(body.amountUsd, "amountUsd");
       const key = idempotencyKey(ctx, `buy-${chainId}-${Date.now()}`);
 
       const ms = await getStoreAsync();
@@ -514,6 +856,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
         throw new HttpError(422, "coin_not_priced", "This coin has no trade price yet.");
       }
+      const priceMicro = toMicroUnits(String(priceUsd));
       const sellerUserId = coin.userId;
 
       // Self-trade guard: the issuer and buyer must be different accounts.
@@ -526,16 +869,24 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
 
       // units: whole coins only in v1 (the chain's base unit is one whole
       // coin — supply/balances are stored and displayed as whole shares).
-      const units = Math.floor(amountUsd / priceUsd);
-      if (units < 1) {
+      // Integer-exact: units = floor(amount_micro / price_micro).
+      const units = amountMicro / priceMicro;
+      if (units < 1n) {
         throw new HttpError(422, "amount_too_small", "amountUsd buys less than one whole coin at this price.");
       }
-      const unitsBase = BigInt(units);
-      const chargedUsd = money6(units * priceUsd);
+      const chargedUsd = fromMicroUnits(units * priceMicro);
+
+      // 80-bps Phase fee (server-authoritative): assessed on the gross
+      // PURCHASED-ASSET UNITS, deducted from the coins the BUYER receives
+      // and sent on-chain to the Phase treasury sovereign address.
+      // Integer-exact: fee = floor(units * bps / 10000); net = units - fee.
+      // The buyer pays exactly the quoted gross USD; the seller receives
+      // the full gross proceeds (no fee is deducted from seller proceeds).
+      const freshFeeCfg = await getFeeConfig();
 
       // Pre-check the float before touching money.
       const floatBal = BigInt(getChainBalance(chainId, PUBLIC_FLOAT_ADDRESS));
-      if (floatBal < unitsBase) {
+      if (floatBal < units) {
         throw new HttpError(409, "insufficient_float",
           "The public float doesn't have enough coins left for this purchase.");
       }
@@ -551,14 +902,17 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
           buyerUserId,
           sellerUserId,
           buyerAddress,
-          units: money6(units),
-          priceUsd: money6(priceUsd),
+          units: coinUnitsToDecimal(units),
+          priceUsd: fromMicroUnits(priceMicro),
           amountUsd: chargedUsd,
           offerChainId: null,
           offerCoinId: null,
           offerUnits: null,
           offerTxId: null,
           sellerAddress: null,
+          feeUnits: null,
+          feeBps: freshFeeCfg.feeBps,
+          feeTxId: null,
         });
         attempt = a;
         if (!created) {
@@ -581,44 +935,131 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         }
       }
       await auditLog(buyerUserId, "settlement_started", "settlement", attempt.id,
-        { chainId, units, amountUsd: chargedUsd });
+        { chainId, units: units.toString(), amountUsd: chargedUsd });
 
-      // Money leg: buyer -> issuer, atomic in the store. Skipped when
-      // resuming an attempt that already moved cash.
+      // A resumed attempt keeps the fee rate recorded when it was created,
+      // so a mid-flight config change can never alter an in-flight trade.
+      // The fee split is deterministic from (units, feeBps), both persisted
+      // on the attempt, so retries always reuse the exact same split.
+      const feeBps = attempt.feeBps ?? freshFeeCfg.feeBps;
+      const feeUnits = (units * BigInt(feeBps)) / 10000n;
+      const netUnits = units - feeUnits;
+      const feeKey = feeIdempotencyKey("buy", key);
+
+      // Money leg: debit buyer (gross USD), credit seller (gross USD in
+      // full), insert the pending fee record — atomically in one Postgres
+      // transaction. The coin-denominated fee is collected on-chain in the
+      // coin leg; no USD fee split exists. Skipped when resuming an
+      // attempt that already moved cash (the fee row idempotency guard
+      // inside settleBuyCashWithFee makes even a missed state update safe).
       if (attempt.state === "started") {
         try {
-          await ms.transfer(buyerUserId, sellerUserId, USD, chargedUsd);
+          await settleBuyCashWithFee({
+            buyerUserId,
+            sellerUserId,
+            grossUsd: chargedUsd,
+            grossUnits: units,
+            feeUnits,
+            netUnits,
+            feeBps,
+            feeKey,
+            coinId: coin.id,
+            ticker: coin.ticker,
+          });
         } catch (err) {
           await ms.setAttemptState(attempt.id, "failed",
             { errorCode: (err as { code?: string }).code ?? "cash_leg_failed" });
           throw err;
         }
+        // Persist the fee units decided at creation so retries and the
+        // reconciliation pass reuse the exact split.
         await ms.setAttemptState(attempt.id, "cash_moved");
+        await getPool().query(
+          `UPDATE settlement_attempts SET fee_units = $2 WHERE id = $1`,
+          [attempt.id, coinUnitsToDecimal(feeUnits)]
+        );
         attempt.state = "cash_moved";
         await auditLog(buyerUserId, "settlement_cash_moved", "settlement", attempt.id,
-          { amountUsd: chargedUsd, sellerUserId });
+          { amountUsd: chargedUsd, feeBps, feeUnits: feeUnits.toString(), netUnits: netUnits.toString(), sellerUserId });
+      } else {
+        // Resumed after cash moved: recover the exact fee split from the
+        // immutable fee record (authoritative over any recomputation).
+        const feeRow = await getFeeByIdempotencyKey(feeKey);
+        if (!feeRow) {
+          await ms.setAttemptState(attempt.id, "failed", { errorCode: "fee_record_missing" });
+          throw new HttpError(409, "settlement_inconsistent",
+            "The purchase cash leg cannot be verified. Contact support with this attempt id.");
+        }
+        // Same idempotency key must mean the same purchase parameters.
+        if (feeRow.grossQuantity !== coinUnitsToDecimal(units) || feeRow.feeBps !== feeBps) {
+          throw new HttpError(409, "idempotency_key_conflict",
+            "This idempotency key was already used for a different purchase amount.");
+        }
       }
 
-      // Coin leg: float -> buyer on the sovereign chain. Skipped when
-      // resuming an attempt that already queued the coin transfer.
+      // Coin leg (crash-safe): float -> buyer (net units, the primary
+      // obligation) then float -> Phase treasury (fee units). Each transfer
+      // is persisted to the attempt row immediately after it succeeds, so a
+      // crash between the two can never double-transfer on retry.
+      // Fail closed: when a fee is owed, the treasury address must be
+      // configured — never settle trades while fee collection is impossible.
       let txId = attempt.coinTxId;
+      let feeTxId = attempt.feeTxId;
       if (attempt.state === "cash_moved") {
+        const treasuryAddr = feeUnits > 0n ? requireTreasurySovereignAddress() : null;
         try {
-          const settled = await settleFloatTransfer(chainId, buyerAddress, unitsBase.toString(),
-            `marketplace buy ${units} ${coin.ticker}`);
-          txId = settled.tx_id;
+          if (!txId) {
+            const settled = await settleFloatTransfer(chainId, buyerAddress, netUnits.toString(),
+              `marketplace buy ${netUnits} ${coin.ticker} (net of Phase fee)`);
+            txId = settled.tx_id;
+            await ms.setAttemptState(attempt.id, "cash_moved", { coinTxId: txId });
+          }
+          if (!feeTxId && feeUnits > 0n) {
+            const feeSettled = await settleFloatTransfer(chainId, treasuryAddr!, feeUnits.toString(),
+              `Phase treasury fee ${feeUnits} ${coin.ticker}`);
+            feeTxId = feeSettled.tx_id;
+            await ms.setAttemptState(attempt.id, "cash_moved", { feeTxId });
+          }
         } catch (err) {
-          // Compensate: unwind the money leg, best effort.
-          try { await ms.transfer(sellerUserId, buyerUserId, USD, chargedUsd); } catch { /* logged below */ }
+          // Best-effort: reverse any on-chain transfer that did complete
+          // (buyer -> float) before unwinding the money leg.
+          if (txId) {
+            try {
+              await settleOperatorTransfer(chainId, buyerAddress, PUBLIC_FLOAT_ADDRESS,
+                netUnits.toString(), "reversed marketplace buy (coin leg failed)");
+            } catch (e) {
+              console.error("[marketplace] buy coin-leg reversal failed:",
+                (e as Error).message);
+            }
+          }
+          // Compensate: unwind the money leg (seller -> buyer, gross),
+          // best effort. The fee was never collected on-chain here.
+          await compensateBuyCashWithFee({
+            sellerUserId,
+            buyerUserId,
+            grossUsd: chargedUsd,
+            feeKey,
+            reason: "coin_leg_failed",
+          });
           await ms.setAttemptState(attempt.id, "compensated",
             { errorCode: (err as { code?: string }).code ?? "coin_leg_failed" });
           console.error("[marketplace] coin leg failed after money leg; compensated:", (err as Error).message);
           throw err;
         }
-        await ms.setAttemptState(attempt.id, "coin_queued", { coinTxId: txId! });
+        // Fee collection recorded atomically: fee row settled + treasury
+        // balance sheet credited. Idempotent on the fee key.
+        await recordBuyFeeSettlement({
+          feeKey,
+          ticker: coin.ticker,
+          feeUnits,
+          feeTxId,
+        });
+        await ms.setAttemptState(attempt.id, "coin_queued", { coinTxId: txId!, feeTxId: feeTxId ?? undefined });
         attempt.state = "coin_queued";
         attempt.coinTxId = txId;
-        await auditLog(buyerUserId, "settlement_coin_queued", "settlement", attempt.id, { txId });
+        attempt.feeTxId = feeTxId;
+        await auditLog(buyerUserId, "settlement_coin_queued", "settlement", attempt.id,
+          { txId, feeTxId, netUnits: netUnits.toString(), feeUnits: feeUnits.toString() });
       }
 
       const trade = await ms.recordTrade({
@@ -627,8 +1068,8 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         coinId: coin.id,
         buyerUserId,
         sellerUserId,
-        units: money6(units),
-        priceUsd: money6(priceUsd),
+        units: coinUnitsToDecimal(units),
+        priceUsd: fromMicroUnits(priceMicro),
         amountUsd: chargedUsd,
         buyerAddress,
         txId,
@@ -640,7 +1081,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       });
       await ms.setAttemptState(attempt.id, "coin_confirmed", { tradeId: trade.id, coinTxId: txId ?? undefined });
       await auditLog(buyerUserId, "trade_recorded", "trade", trade.id,
-        { chainId, units, amountUsd: chargedUsd, txId });
+        { chainId, units: units.toString(), amountUsd: chargedUsd, txId });
 
       const buyerBalance = await ms.getBalance(buyerUserId, USD);
       sendJson(ctx.res, 201, {
@@ -649,6 +1090,122 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         trade,
         txId,
         buyerBalanceUsd: buyerBalance,
+        fee: {
+          feeBps,
+          assetSymbol: coin.ticker,
+          grossUnits: coinUnitsToDecimal(units),
+          feeUnits: coinUnitsToDecimal(feeUnits),
+          buyerReceivesUnits: coinUnitsToDecimal(netUnits),
+          grossUsd: chargedUsd,
+          sellerReceivesUsd: chargedUsd,
+          treasuryAccountId: getTreasuryAccountId(),
+          feeTxId,
+          disclosure: FEE_DISCLOSURE,
+        },
+      });
+    } catch (err) { fail(ctx, err); }
+  });
+
+  // --- GET /api/v1/trades/quote?chainId=&amountUsd= ---
+  // Server-authoritative pre-confirmation quote for buys. The client displays
+  // these values; the final settlement always recomputes them server-side.
+  // The Phase fee is denominated in the purchased asset: the buyer receives
+  // net units (gross - fee); the seller receives the full gross USD.
+  route("GET", "/api/v1/trades/quote", async (ctx) => {
+    try {
+      if (!checkRateLimit(`quote:${clientIp(ctx)}`, 120, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many quote requests — wait a moment.");
+      }
+      const chainId = ctx.query.get("chainId") ?? "";
+      if (!chainId) throw new HttpError(400, "missing_chain_id", "Query must include chainId.");
+      const amountMicro = parsePositiveMicroUnits(ctx.query.get("amountUsd"), "amountUsd");
+      const issuance = await getIssuanceStore();
+      const coin: IssuanceCoin | null = await issuance.getCoinByChainId(chainId);
+      if (!coin) throw new HttpError(404, "coin_not_found", "No issued coin for this chain.");
+      const priceUsd = Number(coin.priceUsd);
+      if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
+        throw new HttpError(422, "coin_not_priced", "This coin has no trade price yet.");
+      }
+      const priceMicro = toMicroUnits(String(priceUsd));
+      // Integer-exact: units = floor(amount / price); fee = floor(units * bps / 10000).
+      const units = amountMicro / priceMicro;
+      if (units < 1n) {
+        throw new HttpError(422, "amount_too_small", "amountUsd buys less than one whole coin at this price.");
+      }
+      const grossUsd = fromMicroUnits(units * priceMicro);
+      const cfg = await getFeeConfig();
+      const feeUnits = (units * BigInt(cfg.feeBps)) / 10000n;
+      const netUnits = units - feeUnits;
+      sendJson(ctx.res, 200, {
+        ...NETWORK_ENVELOPE,
+        quote: {
+          kind: "buy",
+          chainId,
+          ticker: coin.ticker,
+          priceUsd: fromMicroUnits(priceMicro),
+          grossUnits: coinUnitsToDecimal(units),
+          grossUsd,
+          feeBps: cfg.feeBps,
+          feeAssetSymbol: coin.ticker,
+          feeUnits: coinUnitsToDecimal(feeUnits),
+          buyerReceivesUnits: coinUnitsToDecimal(netUnits),
+          sellerReceivesUsd: grossUsd,
+          treasuryAccountId: getTreasuryAccountId(),
+          disclosure: FEE_DISCLOSURE,
+        },
+      });
+    } catch (err) { fail(ctx, err); }
+  });
+
+  // --- GET /api/v1/trades/swap-quote?chainId=&offerChainId=&offerUnits= ---
+  route("GET", "/api/v1/trades/swap-quote", async (ctx) => {
+    try {
+      if (!checkRateLimit(`squote:${clientIp(ctx)}`, 120, 60_000)) {
+        throw new HttpError(429, "rate_limited", "Too many quote requests — wait a moment.");
+      }
+      const chainId = ctx.query.get("chainId") ?? "";
+      const offerChainId = ctx.query.get("offerChainId") ?? "";
+      if (!chainId || !offerChainId) {
+        throw new HttpError(400, "missing_params", "Query must include chainId and offerChainId.");
+      }
+      const offerUnits = parseWholeCoinUnits(ctx.query.get("offerUnits"), "offerUnits");
+      const issuance = await getIssuanceStore();
+      const target: IssuanceCoin | null = await issuance.getCoinByChainId(chainId);
+      const offer: IssuanceCoin | null = await issuance.getCoinByChainId(offerChainId);
+      if (!target || !offer) throw new HttpError(404, "coin_not_found", "Unknown coin chain.");
+      const targetPrice = Number(target.priceUsd);
+      const offerPrice = Number(offer.priceUsd);
+      if (!Number.isFinite(targetPrice) || targetPrice <= 0 || !Number.isFinite(offerPrice) || offerPrice <= 0) {
+        throw new HttpError(422, "coin_not_priced", "Both coins need a trade price for swaps.");
+      }
+      // Integer-exact: target = floor(offer_units * offer_price / target_price),
+      // fee = floor(target * bps / 10000), net = target - fee.
+      const targetPriceMicro = toMicroUnits(String(targetPrice));
+      const offerPriceMicro = toMicroUnits(String(offerPrice));
+      const targetUnits = (offerUnits * offerPriceMicro) / targetPriceMicro;
+      if (targetUnits < 1n) {
+        throw new HttpError(422, "amount_too_small",
+          "The offer is worth less than one whole target coin at current prices.");
+      }
+      const cfg = await getFeeConfig();
+      const feeUnits = (targetUnits * BigInt(cfg.feeBps)) / 10000n;
+      const netUnits = targetUnits - feeUnits;
+      sendJson(ctx.res, 200, {
+        ...NETWORK_ENVELOPE,
+        quote: {
+          kind: "swap",
+          chainId,
+          targetTicker: target.ticker,
+          offerChainId,
+          offerTicker: offer.ticker,
+          offerUnits: offerUnits.toString(),
+          grossUnits: coinUnitsToDecimal(targetUnits),
+          feeBps: cfg.feeBps,
+          feeUnits: coinUnitsToDecimal(feeUnits),
+          buyerReceivesUnits: coinUnitsToDecimal(netUnits),
+          treasuryAddress: getTreasurySovereignAddress(),
+          disclosure: FEE_DISCLOSURE,
+        },
       });
     } catch (err) { fail(ctx, err); }
   });
@@ -737,10 +1294,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       const offerChainId = str(body.offerChainId);
       if (!offerChainId) throw new HttpError(400, "missing_offer_chain_id", "Body must include offerChainId (your coin's chain).");
       // offerUnits: whole coins only, >= 1 (fractional offers are floored).
-      const offerUnitsWhole = Math.floor(parsePositiveMoney(body.offerUnits, "offerUnits"));
-      if (offerUnitsWhole < 1) {
-        throw new HttpError(422, "amount_too_small", "offerUnits must be at least one whole coin.");
-      }
+      const offerUnits = parseWholeCoinUnits(body.offerUnits, "offerUnits");
       const key = idempotencyKey(ctx, `swap-${chainId}-${Date.now()}`);
 
       const ms = await getStoreAsync();
@@ -775,14 +1329,25 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
           "The target coin's issuer has no sovereign wallet address on file — swaps are unavailable for it.");
       }
 
-      const offerValueUsd = offerUnitsWhole * offerPrice;
-      const targetUnits = Math.floor(offerValueUsd / targetPrice);
-      if (targetUnits < 1) {
+      // Integer-exact: offer value = offer_units * offer_price (microunits);
+      // target units = floor(offer_value / target_price).
+      const targetPriceMicro = toMicroUnits(String(targetPrice));
+      const offerPriceMicro = toMicroUnits(String(offerPrice));
+      const offerValueMicro = offerUnits * offerPriceMicro;
+      const targetUnits = offerValueMicro / targetPriceMicro;
+      if (targetUnits < 1n) {
         throw new HttpError(422, "amount_too_small",
           "The offer is worth less than one whole target coin at current prices.");
       }
-      const offerUnitsBase = BigInt(offerUnitsWhole).toString();
-      const targetUnitsBase = BigInt(targetUnits).toString();
+      const offerUnitsBase = offerUnits.toString();
+
+      // 80-bps Phase fee (server-authoritative) on swaps: assessed in the
+      // TARGET coin — fee = floor(targetUnits * bps / 10000) whole coins,
+      // deducted from the coins the buyer receives and sent on-chain to the
+      // Phase treasury address. Fail closed when no treasury is configured.
+      const freshSwapFeeCfg = await getFeeConfig();
+      const treasurySovereignAddr = requireTreasurySovereignAddress();
+      const swapFeeUnitsBig = (targetUnits * BigInt(freshSwapFeeCfg.feeBps)) / 10000n;
 
       // Pre-check the buyer's offer balance before writing anything.
       let offerBal: bigint;
@@ -791,13 +1356,13 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       } catch (err) {
         throw new HttpError(404, "offer_coin_not_found", "The offer chain is unknown on this node.");
       }
-      if (offerBal < BigInt(offerUnitsWhole)) {
+      if (offerBal < offerUnits) {
         throw new HttpError(409, "insufficient_offer_balance",
           "You don't hold enough of your offered coin at buyerAddress for this swap.");
       }
       // Pre-check the target float before writing anything.
       const floatBal = BigInt(getChainBalance(chainId, PUBLIC_FLOAT_ADDRESS));
-      if (floatBal < BigInt(targetUnits)) {
+      if (floatBal < targetUnits) {
         throw new HttpError(409, "insufficient_float",
           "The target coin's public float doesn't have enough coins left for this swap.");
       }
@@ -813,14 +1378,17 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
           buyerUserId,
           sellerUserId,
           buyerAddress,
-          units: money6(targetUnits),
-          priceUsd: money6(targetPrice),
-          amountUsd: money6(offerValueUsd),
+          units: coinUnitsToDecimal(targetUnits),
+          priceUsd: fromMicroUnits(targetPriceMicro),
+          amountUsd: fromMicroUnits(offerValueMicro),
           offerChainId,
           offerCoinId: offer.id,
-          offerUnits: money6(offerUnitsWhole),
+          offerUnits: coinUnitsToDecimal(offerUnits),
           offerTxId: null,
           sellerAddress,
+          feeUnits: coinUnitsToDecimal(swapFeeUnitsBig),
+          feeBps: freshSwapFeeCfg.feeBps,
+          feeTxId: null,
         });
         attempt = a;
         if (!created) {
@@ -843,7 +1411,17 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         }
       }
       await auditLog(buyerUserId, "settlement_started", "settlement", attempt.id,
-        { kind: "swap", chainId, offerChainId, targetUnits, offerUnits: offerUnitsWhole });
+        { kind: "swap", chainId, offerChainId, targetUnits: targetUnits.toString(), offerUnits: offerUnits.toString() });
+
+      // A resumed attempt keeps the fee values recorded when it was created.
+      // The split is deterministic from (units, feeBps), both persisted.
+      const swapFeeBps = attempt.feeBps ?? freshSwapFeeCfg.feeBps;
+      const swapGrossUnits = decimalToCoinUnits(attempt.units);
+      const swapFeeUnits = attempt.feeUnits !== null && attempt.feeUnits !== undefined
+        ? decimalToCoinUnits(attempt.feeUnits)
+        : (swapGrossUnits * BigInt(swapFeeBps)) / 10000n;
+      const swapNetUnits = swapGrossUnits - swapFeeUnits;
+      const swapFeeKey = feeIdempotencyKey("swap", key);
 
       // Offer leg: buyer -> target issuer on the OFFER chain. Skipped when
       // resuming an attempt that already moved the offer.
@@ -851,7 +1429,7 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       if (attempt.state === "started") {
         try {
           const settled = await settleOperatorTransfer(offerChainId, buyerAddress, sellerAddress,
-            offerUnitsBase, `swap offer ${offerUnitsWhole} ${offer.ticker} for ${target.ticker}`);
+            offerUnitsBase, `swap offer ${offerUnits} ${offer.ticker} for ${target.ticker}`);
           offerTxId = settled.tx_id;
         } catch (err) {
           await ms.setAttemptState(attempt.id, "failed",
@@ -862,19 +1440,39 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         attempt.state = "offer_moved";
         attempt.offerTxId = offerTxId;
         await auditLog(buyerUserId, "swap_offer_moved", "settlement", attempt.id,
-          { offerTxId, offerChainId, offerUnits: offerUnitsWhole, sellerAddress });
+          { offerTxId, offerChainId, offerUnits: offerUnits.toString(), sellerAddress });
       }
 
-      // Target leg: float -> buyer on the TARGET chain. Skipped when
-      // resuming an attempt that already queued it. On failure the offer
-      // leg is reversed (best effort) and the attempt is compensated.
+      // Target leg (crash-safe): float -> buyer (net of the Phase fee) on the
+      // TARGET chain, then float -> Phase treasury (the fee). Each transfer is
+      // persisted to the attempt row immediately after it succeeds, so a
+      // crash between the two can never double-transfer on retry. Skipped
+      // when resuming an attempt that already queued them. On failure the
+      // moved legs are reversed (best effort) and the attempt is compensated.
       let targetTxId = attempt.coinTxId;
+      let feeTxId = attempt.feeTxId;
       if (attempt.state === "offer_moved") {
         try {
-          const settled = await settleFloatTransfer(chainId, buyerAddress, targetUnitsBase,
-            `swap receive ${targetUnits} ${target.ticker}`);
-          targetTxId = settled.tx_id;
+          if (!targetTxId) {
+            const buyerSettled = await settleFloatTransfer(chainId, buyerAddress, swapNetUnits.toString(),
+              `swap receive ${swapNetUnits} ${target.ticker} (net of ${swapFeeUnits} ${target.ticker} Phase fee)`);
+            targetTxId = buyerSettled.tx_id;
+            await ms.setAttemptState(attempt.id, "offer_moved", { coinTxId: targetTxId });
+          }
+          if (!feeTxId && swapFeeUnits > 0n) {
+            const feeSettled = await settleFloatTransfer(chainId, treasurySovereignAddr,
+              swapFeeUnits.toString(), `Phase swap fee ${swapFeeUnits} ${target.ticker}`);
+            feeTxId = feeSettled.tx_id;
+            await ms.setAttemptState(attempt.id, "offer_moved", { feeTxId });
+          }
         } catch (err) {
+          // Reverse the buyer's net receipt (best effort), then the offer leg.
+          try {
+            if (targetTxId) {
+              await settleOperatorTransfer(chainId, buyerAddress, PUBLIC_FLOAT_ADDRESS,
+                swapNetUnits.toString(), "swap compensation: return net target units to float");
+            }
+          } catch { /* best effort — the attempt row records what happened */ }
           try {
             await settleOperatorTransfer(offerChainId, sellerAddress, buyerAddress,
               offerUnitsBase, "swap compensation reversal");
@@ -884,10 +1482,25 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
           console.error("[marketplace] swap target leg failed after offer leg; compensated:", (err as Error).message);
           throw err;
         }
-        await ms.setAttemptState(attempt.id, "target_queued", { coinTxId: targetTxId! });
+        await ms.setAttemptState(attempt.id, "target_queued",
+          { coinTxId: targetTxId!, feeTxId: feeTxId ?? undefined });
         attempt.state = "target_queued";
         attempt.coinTxId = targetTxId;
-        await auditLog(buyerUserId, "swap_target_queued", "settlement", attempt.id, { targetTxId });
+        attempt.feeTxId = feeTxId;
+        // Immutable fee record (idempotent) + treasury balance-sheet credit.
+        await recordSwapFee({
+          feeKey: swapFeeKey,
+          buyerUserId,
+          coinId: target.id,
+          assetSymbol: target.ticker,
+          grossUnits: coinUnitsToDecimal(swapGrossUnits),
+          feeBps: swapFeeBps,
+          feeUnits: coinUnitsToDecimal(swapFeeUnits),
+          netUnits: coinUnitsToDecimal(swapNetUnits),
+          feeTxId,
+        });
+        await auditLog(buyerUserId, "swap_target_queued", "settlement", attempt.id,
+          { targetTxId, feeTxId, feeUnits: swapFeeUnits.toString(), feeBps: swapFeeBps });
       }
 
       const trade = await ms.recordTrade({
@@ -896,21 +1509,21 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         coinId: target.id,
         buyerUserId,
         sellerUserId,
-        units: money6(targetUnits),
-        priceUsd: money6(targetPrice),
-        amountUsd: money6(offerValueUsd),
+        units: coinUnitsToDecimal(targetUnits),
+        priceUsd: fromMicroUnits(targetPriceMicro),
+        amountUsd: fromMicroUnits(offerValueMicro),
         buyerAddress,
         txId: targetTxId,
         idempotencyKey: key,
         offerChainId,
         offerCoinId: offer.id,
-        offerUnits: money6(offerUnitsWhole),
+        offerUnits: coinUnitsToDecimal(offerUnits),
         offerTxId,
       });
       await ms.setAttemptState(attempt.id, "coin_confirmed",
         { tradeId: trade.id, coinTxId: targetTxId ?? undefined });
       await auditLog(buyerUserId, "trade_recorded", "trade", trade.id,
-        { kind: "swap", chainId, targetUnits, offerUnits: offerUnitsWhole, offerTxId, targetTxId });
+        { kind: "swap", chainId, targetUnits: targetUnits.toString(), offerUnits: offerUnits.toString(), offerTxId, targetTxId });
 
       sendJson(ctx.res, 201, {
         ...NETWORK_ENVELOPE,
@@ -918,6 +1531,16 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
         trade,
         offerTxId,
         targetTxId,
+        fee: {
+          feeBps: swapFeeBps,
+          assetSymbol: target.ticker,
+          grossUnits: coinUnitsToDecimal(swapGrossUnits),
+          feeUnits: coinUnitsToDecimal(swapFeeUnits),
+          buyerReceivesUnits: coinUnitsToDecimal(swapNetUnits),
+          feeTxId,
+          treasuryAddress: treasurySovereignAddr,
+          disclosure: FEE_DISCLOSURE,
+        },
       });
     } catch (err) { fail(ctx, err); }
   });
@@ -982,7 +1605,7 @@ export async function reconcileSettlements(): Promise<{ finished: number; compen
   // Reverse a completed swap offer leg (best effort) when the target leg
   // cannot complete.
   const compensateSwap = async (a: SettlementAttempt, errorCode: string): Promise<void> => {
-    const offerUnitsBase = BigInt(Math.round(Number(a.offerUnits ?? "0")));
+    const offerUnitsBase = a.offerUnits ? decimalToCoinUnits(a.offerUnits) : 0n;
     try {
       if (a.offerChainId && a.sellerAddress && offerUnitsBase > 0n) {
         await settleOperatorTransfer(a.offerChainId, a.sellerAddress, a.buyerAddress,
@@ -993,12 +1616,90 @@ export async function reconcileSettlements(): Promise<{ finished: number; compen
     await auditLog("system", "swap_compensated", "settlement", a.id, { errorCode });
   };
 
+  // Fee-aware unwind of a buy money leg (coin leg failed after cash moved).
+  // Falls back to the legacy full-gross reversal for attempts that predate
+  // the fee system (no fee row).
+  const compensateBuy = async (a: SettlementAttempt, errorCode: string): Promise<void> => {
+    const fee = await getFeeByIdempotencyKey(feeIdempotencyKey("buy", a.idempotencyKey));
+    if (fee && (fee.status === "pending" || fee.status === "settled")) {
+      await compensateBuyCashWithFee({
+        sellerUserId: a.sellerUserId,
+        buyerUserId: a.buyerUserId,
+        grossUsd: a.amountUsd,
+        feeKey: fee.idempotencyKey,
+        reason: errorCode,
+      });
+    } else {
+      try { await ms.transfer(a.sellerUserId, a.buyerUserId, USD, a.amountUsd); } catch { /* best effort */ }
+    }
+    await ms.setAttemptState(a.id, "compensated", { errorCode });
+    await auditLog("system", "buy_compensated", "settlement", a.id, { errorCode });
+  };
+
+  /** Fee split for a swap attempt: { gross, fee, net } in whole coin units. */
+  const swapFeeSplit = async (a: SettlementAttempt): Promise<{ gross: bigint; fee: bigint; net: bigint; feeBps: number }> => {
+    const gross = decimalToCoinUnits(a.units);
+    const feeBps = a.feeBps ?? (await getFeeConfig()).feeBps;
+    const fee = a.feeUnits ? decimalToCoinUnits(a.feeUnits) : (gross * BigInt(feeBps)) / 10000n;
+    return { gross, fee, net: gross - fee, feeBps };
+  };
+
+  const swapTicker = async (a: SettlementAttempt): Promise<string> => {
+    try {
+      const issuance = await getIssuanceStore();
+      const coin = await issuance.getCoinByChainId(a.chainId);
+      return coin?.ticker ?? "UNKNOWN";
+    } catch { return "UNKNOWN"; }
+  };
+
+  /**
+   * Ensure the swap fee record exists after the target leg. Covers the crash
+   * window between the on-chain fee transfer and the fee_ledger insert:
+   * if the fee transfer never ran and a fee is owed, run it now.
+   */
+  const recoverSwapFee = async (a: SettlementAttempt): Promise<void> => {
+    const feeKey = feeIdempotencyKey("swap", a.idempotencyKey);
+    if (await getFeeByIdempotencyKey(feeKey)) return;
+    const { gross, fee, net, feeBps } = await swapFeeSplit(a);
+    let feeTxId = a.feeTxId;
+    if (!feeTxId && fee > 0n) {
+      const treasuryAddr = getTreasurySovereignAddress();
+      if (treasuryAddr) {
+        try {
+          const settled = await settleFloatTransfer(a.chainId, treasuryAddr,
+            fee.toString(), "recovered Phase swap fee");
+          feeTxId = settled.tx_id;
+          await ms.setAttemptState(a.id, a.state, { feeTxId });
+          a.feeTxId = feeTxId;
+        } catch (e) {
+          console.error("[marketplace] swap fee recovery transfer failed:",
+            e instanceof Error ? e.message : String(e));
+        }
+      }
+    }
+    if (feeTxId || fee === 0n) {
+      await recordSwapFee({
+        feeKey,
+        buyerUserId: a.buyerUserId,
+        coinId: a.coinId,
+        assetSymbol: await swapTicker(a),
+        grossUnits: coinUnitsToDecimal(gross),
+        feeBps,
+        feeUnits: coinUnitsToDecimal(fee),
+        netUnits: coinUnitsToDecimal(net),
+        feeTxId,
+      });
+    } else {
+      await auditLog("system", "swap_fee_recovery_pending", "settlement", a.id,
+        { note: "fee transfer could not complete; left for operator review" });
+    }
+  };
+
   for (const a of open) {
     try {
       // --- swap attempts: started -> offer_moved -> target_queued -> coin_confirmed ---
       if (a.kind === "swap") {
         const offerUnitsBase = BigInt(Math.round(Number(a.offerUnits ?? "0")));
-        const targetUnitsBase = BigInt(Math.round(Number(a.units)));
         if (a.state === "started") {
           // Offer leg never moved — safe to attempt it fresh.
           try {
@@ -1017,23 +1718,44 @@ export async function reconcileSettlements(): Promise<{ finished: number; compen
         }
         if (a.state === "offer_moved") {
           // Offer moved, target leg never queued — check float then retry.
+          // The retry mirrors the endpoint: buyer receives net units,
+          // the Phase fee goes to the treasury address. Each transfer is
+          // persisted immediately so a crash between them can't double-send.
+          const { gross, fee, net } = await swapFeeSplit(a);
           let floatBal: bigint;
           try {
             floatBal = BigInt(getChainBalance(a.chainId, PUBLIC_FLOAT_ADDRESS));
           } catch {
             floatBal = 0n;
           }
-          if (floatBal < targetUnitsBase) {
+          if (floatBal < gross) {
             await compensateSwap(a, "insufficient_float_on_retry");
             result.compensated++;
             continue;
           }
           try {
-            const settled = await settleFloatTransfer(a.chainId, a.buyerAddress,
-              targetUnitsBase.toString(), "reconciled swap target");
-            await ms.setAttemptState(a.id, "target_queued", { coinTxId: settled.tx_id });
+            let coinTxId = a.coinTxId;
+            let feeTxId: string | null = a.feeTxId;
+            if (!coinTxId) {
+              const settled = await settleFloatTransfer(a.chainId, a.buyerAddress,
+                net.toString(), "reconciled swap target (net of Phase fee)");
+              coinTxId = settled.tx_id;
+              await ms.setAttemptState(a.id, "offer_moved", { coinTxId });
+            }
+            if (!feeTxId && fee > 0n) {
+              const treasuryAddr = getTreasurySovereignAddress();
+              if (treasuryAddr) {
+                const feeSettled = await settleFloatTransfer(a.chainId, treasuryAddr,
+                  fee.toString(), "reconciled Phase swap fee");
+                feeTxId = feeSettled.tx_id;
+                await ms.setAttemptState(a.id, "offer_moved", { feeTxId });
+              }
+            }
+            await ms.setAttemptState(a.id, "target_queued",
+              { coinTxId: coinTxId, feeTxId: feeTxId ?? undefined });
             a.state = "target_queued";
-            a.coinTxId = settled.tx_id;
+            a.coinTxId = coinTxId;
+            a.feeTxId = feeTxId;
           } catch (err) {
             await compensateSwap(a, (err as { code?: string }).code ?? "target_leg_failed");
             result.compensated++;
@@ -1066,6 +1788,13 @@ export async function reconcileSettlements(): Promise<{ finished: number; compen
             } else {
               await ms.setAttemptState(a.id, "coin_confirmed");
             }
+            // Fee recovery: if the fee transfer completed but its ledger row
+            // was never written (crash window), record it now. If the fee
+            // transfer never ran and a fee is owed, run it now.
+            try { await recoverSwapFee(a); } catch (e) {
+              console.error("[marketplace] swap fee recovery failed:",
+                e instanceof Error ? e.message : String(e));
+            }
             result.finished++;
           } else if (!tx || tx.status === "failed") {
             // Target coins never landed — reverse the offer leg.
@@ -1079,14 +1808,32 @@ export async function reconcileSettlements(): Promise<{ finished: number; compen
       }
 
       if (a.state === "started") {
-        // Nothing moved — safe to abandon.
-        await ms.setAttemptState(a.id, "failed", { errorCode: "abandoned_at_boot" });
-        result.failed++;
-        continue;
+        // Nothing moved — safe to abandon, UNLESS the money leg already
+        // settled (crash between COMMIT and the state update). The fee row
+        // is the authoritative idempotency guard for the buy money leg: it
+        // exists (pending or settled) iff the money leg committed.
+        let moneySettled = false;
+        if (a.kind === "buy") {
+          const fee = await getFeeByIdempotencyKey(feeIdempotencyKey("buy", a.idempotencyKey));
+          moneySettled = !!fee && (fee.status === "pending" || fee.status === "settled");
+        }
+        if (!moneySettled) {
+          await ms.setAttemptState(a.id, "failed", { errorCode: "abandoned_at_boot" });
+          result.failed++;
+          continue;
+        }
+        a.state = "cash_moved"; // resume into the coin-leg retry below
       }
       if (a.state === "cash_moved") {
         // Cash moved, coin leg never queued — retry the coin leg once.
-        const unitsBase = BigInt(Math.round(Number(a.units)));
+        // Corrected model: buyer receives NET units, the Phase fee goes to
+        // the treasury address. Each transfer is persisted immediately so a
+        // crash between them can't double-send on the next retry.
+        const unitsBase = decimalToCoinUnits(a.units);
+        const feeBps = a.feeBps ?? (await getFeeConfig()).feeBps;
+        const feeUnits = a.feeUnits ? decimalToCoinUnits(a.feeUnits)
+          : (unitsBase * BigInt(feeBps)) / 10000n;
+        const netUnits = unitsBase - feeUnits;
         let floatBal: bigint;
         try {
           floatBal = BigInt(getChainBalance(a.chainId, PUBLIC_FLOAT_ADDRESS));
@@ -1094,20 +1841,41 @@ export async function reconcileSettlements(): Promise<{ finished: number; compen
           floatBal = 0n;
         }
         if (floatBal < unitsBase) {
-          try { await ms.transfer(a.sellerUserId, a.buyerUserId, USD, a.amountUsd); } catch { /* best effort */ }
-          await ms.setAttemptState(a.id, "compensated", { errorCode: "insufficient_float_on_retry" });
+          await compensateBuy(a, "insufficient_float_on_retry");
           result.compensated++;
           continue;
         }
+        const feeKey = feeIdempotencyKey("buy", a.idempotencyKey);
+        let ticker = "UNKNOWN";
         try {
-          const settled = await settleFloatTransfer(a.chainId, a.buyerAddress, unitsBase.toString(),
-            "reconciled marketplace buy");
-          await ms.setAttemptState(a.id, "coin_queued", { coinTxId: settled.tx_id });
+          const issuance = await getIssuanceStore();
+          const coin = await issuance.getCoinByChainId(a.chainId);
+          if (coin) ticker = coin.ticker;
+        } catch { /* keep UNKNOWN */ }
+        try {
+          let coinTxId = a.coinTxId;
+          let feeTxId: string | null = a.feeTxId;
+          if (!coinTxId) {
+            const settled = await settleFloatTransfer(a.chainId, a.buyerAddress, netUnits.toString(),
+              "reconciled marketplace buy (net of Phase fee)");
+            coinTxId = settled.tx_id;
+            await ms.setAttemptState(a.id, "cash_moved", { coinTxId });
+          }
+          if (!feeTxId && feeUnits > 0n) {
+            const treasuryAddr = getTreasurySovereignAddress();
+            if (!treasuryAddr) throw new Error("treasury_unconfigured");
+            const feeSettled = await settleFloatTransfer(a.chainId, treasuryAddr,
+              feeUnits.toString(), "reconciled Phase buy fee");
+            feeTxId = feeSettled.tx_id;
+            await ms.setAttemptState(a.id, "cash_moved", { feeTxId });
+          }
+          // Fee collection recorded atomically (idempotent on the fee key).
+          await recordBuyFeeSettlement({ feeKey, ticker, feeUnits, feeTxId });
+          await ms.setAttemptState(a.id, "coin_queued",
+            { coinTxId: coinTxId, feeTxId: feeTxId ?? undefined });
           result.finished++;
         } catch (err) {
-          try { await ms.transfer(a.sellerUserId, a.buyerUserId, USD, a.amountUsd); } catch { /* best effort */ }
-          await ms.setAttemptState(a.id, "compensated",
-            { errorCode: (err as { code?: string }).code ?? "coin_leg_failed" });
+          await compensateBuy(a, (err as { code?: string }).code ?? "coin_leg_failed");
           result.compensated++;
         }
         continue;
@@ -1140,9 +1908,8 @@ export async function reconcileSettlements(): Promise<{ finished: number; compen
           }
           result.finished++;
         } else if (!tx || tx.status === "failed") {
-          // Coin never landed — unwind the cash.
-          try { await ms.transfer(a.sellerUserId, a.buyerUserId, USD, a.amountUsd); } catch { /* best effort */ }
-          await ms.setAttemptState(a.id, "compensated", { errorCode: "coin_tx_failed" });
+          // Coin never landed — unwind the cash (fee-aware).
+          await compensateBuy(a, "coin_tx_failed");
           result.compensated++;
         }
         // else still pending — the sequencer will confirm it from the
