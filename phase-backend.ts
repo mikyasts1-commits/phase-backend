@@ -1121,18 +1121,6 @@ mountIssuanceRoutes({ route, sendJson, HttpError });
 // alongside the issuance flow that depends on it.
 mountAuthRoutes({ route, sendJson, HttpError });
 
-// --- TEMPORARY ADMIN: wipe all users (remove after use) ---
-route("POST", "/api/v1/admin/wipe-users", async (ctx) => {
-  const { dbQuery } = await import("./db.js");
-  const users = await dbQuery("SELECT id, email FROM issuance_users");
-  // Delete child tables first (foreign keys without CASCADE)
-  await dbQuery("DELETE FROM market_trades").catch(() => {});
-  await dbQuery("DELETE FROM market_balances").catch(() => {});
-  await dbQuery("DELETE FROM ledger_entries").catch(() => {});
-  await dbQuery("DELETE FROM issuance_users");
-  sendJson(ctx.res, 200, { ok: true, wiped: users.map((u: any) => u.email) });
-});
-
 // --- 8e-vi. Sovereign ledger (Phase 1 MVP; see sovereign-ledger.ts) ---
 // Per-user sovereign chains with Ed25519-signed transactions. Write-through
 // Postgres persistence (migration 008) + boot restore; legal review pending.
