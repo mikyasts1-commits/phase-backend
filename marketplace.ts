@@ -938,15 +938,31 @@ export async function executeSwapSettlement(input: SwapSettlementInput): Promise
   const swapFeeUnitsBig = (targetUnits * BigInt(freshSwapFeeCfg.feeBps)) / 10000n;
 
   // Pre-check the buyer's offer balance before writing anything.
+  // The issuer's retained stake lives at the coin's recorded issuerAddress
+  // (credited at genesis); a device wallet can change across installs, so
+  // when the client-supplied address doesn't hold the offered units, fall
+  // back to the recorded issuer address. The caller is already proven to be
+  // this coin's issuer (offer.userId === buyerUserId is enforced above), so
+  // debiting the recorded address is safe. Settlement below uses the
+  // resolved address for both legs.
+  let effectiveBuyerAddress = buyerAddress;
   let offerBal: bigint;
   try {
     offerBal = BigInt(getChainBalance(offerChainId, buyerAddress));
   } catch (err) {
     throw new MarketplaceHttpError(404, "offer_coin_not_found", "The offer chain is unknown on this node.");
   }
+  if (offerBal < offerUnits && isValidAddress(offer.issuerAddress) && offer.issuerAddress !== buyerAddress) {
+    let issuerBal = 0n;
+    try { issuerBal = BigInt(getChainBalance(offerChainId, offer.issuerAddress)); } catch { issuerBal = 0n; }
+    if (issuerBal >= offerUnits) {
+      effectiveBuyerAddress = offer.issuerAddress;
+      offerBal = issuerBal;
+    }
+  }
   if (offerBal < offerUnits) {
     throw new MarketplaceHttpError(409, "insufficient_offer_balance",
-      "You don't hold enough of your offered coin at buyerAddress for this swap.");
+      "You don't hold enough of your offered coin for this swap.");
   }
   // Pre-check the target float before writing anything.
   const floatBal = BigInt(getChainBalance(chainId, PUBLIC_FLOAT_ADDRESS));
@@ -965,7 +981,7 @@ export async function executeSwapSettlement(input: SwapSettlementInput): Promise
       coinId: target.id,
       buyerUserId,
       sellerUserId,
-      buyerAddress,
+      buyerAddress: effectiveBuyerAddress,
       units: coinUnitsToDecimal(targetUnits),
       priceUsd: fromMicroUnits(targetPriceMicro),
       amountUsd: fromMicroUnits(offerValueMicro),
@@ -1015,7 +1031,7 @@ export async function executeSwapSettlement(input: SwapSettlementInput): Promise
   let offerTxId = attempt.offerTxId;
   if (attempt.state === "started") {
     try {
-      const settled = await settleOperatorTransfer(offerChainId, buyerAddress, sellerAddress,
+      const settled = await settleOperatorTransfer(offerChainId, effectiveBuyerAddress, sellerAddress,
         offerUnitsBase, `swap offer ${offerUnits} ${offer.ticker} for ${target.ticker}`);
       offerTxId = settled.tx_id;
     } catch (err) {
@@ -1041,7 +1057,7 @@ export async function executeSwapSettlement(input: SwapSettlementInput): Promise
   if (attempt.state === "offer_moved") {
     try {
       if (!targetTxId) {
-        const buyerSettled = await settleFloatTransfer(chainId, buyerAddress, swapNetUnits.toString(),
+        const buyerSettled = await settleFloatTransfer(chainId, effectiveBuyerAddress, swapNetUnits.toString(),
           `swap receive ${swapNetUnits} ${target.ticker} (net of ${swapFeeUnits} ${target.ticker} Phase fee)`);
         targetTxId = buyerSettled.tx_id;
         await ms.setAttemptState(attempt.id, "offer_moved", { coinTxId: targetTxId });
@@ -1056,12 +1072,12 @@ export async function executeSwapSettlement(input: SwapSettlementInput): Promise
       // Reverse the buyer's net receipt (best effort), then the offer leg.
       try {
         if (targetTxId) {
-          await settleOperatorTransfer(chainId, buyerAddress, PUBLIC_FLOAT_ADDRESS,
+          await settleOperatorTransfer(chainId, effectiveBuyerAddress, PUBLIC_FLOAT_ADDRESS,
             swapNetUnits.toString(), "swap compensation: return net target units to float");
         }
       } catch { /* best effort — the attempt row records what happened */ }
       try {
-        await settleOperatorTransfer(offerChainId, sellerAddress, buyerAddress,
+        await settleOperatorTransfer(offerChainId, sellerAddress, effectiveBuyerAddress,
           offerUnitsBase, "swap compensation reversal");
       } catch { /* best effort — the attempt row records what happened */ }
       await ms.setAttemptState(attempt.id, "compensated",
@@ -1099,7 +1115,7 @@ export async function executeSwapSettlement(input: SwapSettlementInput): Promise
     units: coinUnitsToDecimal(targetUnits),
     priceUsd: fromMicroUnits(targetPriceMicro),
     amountUsd: fromMicroUnits(offerValueMicro),
-    buyerAddress,
+    buyerAddress: effectiveBuyerAddress,
     txId: targetTxId,
     idempotencyKey: key,
     offerChainId,

@@ -398,11 +398,25 @@ export function mountOffersRoutes(deps: OffersMountDeps): void {
         }
       }
       // The buyer must actually hold the offered units at creation time.
+      // The issuer's retained stake lives at the coin's recorded issuerAddress
+      // (credited at genesis); a device wallet can change across installs, so
+      // fall back to the recorded address when the client-supplied address
+      // doesn't hold the offered units. Only the coin's issuer can reach this
+      // point (offer_not_yours is enforced above), so this is safe.
+      let effectiveBuyerAddress = buyerAddress;
       let offerBal: bigint;
       try {
         offerBal = BigInt(getChainBalance(offerChainId, buyerAddress));
       } catch {
         throw new HttpError(404, "offer_coin_not_found", "The offer chain is unknown on this node.");
+      }
+      if (offerBal < offerUnits && isValidAddress(offerCoin.issuerAddress) && offerCoin.issuerAddress !== buyerAddress) {
+        let issuerBal = 0n;
+        try { issuerBal = BigInt(getChainBalance(offerChainId, offerCoin.issuerAddress)); } catch { issuerBal = 0n; }
+        if (issuerBal >= offerUnits) {
+          effectiveBuyerAddress = offerCoin.issuerAddress;
+          offerBal = issuerBal;
+        }
       }
       if (offerBal < offerUnits) {
         throw new HttpError(409, "insufficient_offer_balance", "You don't hold enough of your offered coin for this proposal.");
@@ -415,7 +429,7 @@ export function mountOffersRoutes(deps: OffersMountDeps): void {
         targetCoinId: target.id,
         sellerUserId: target.userId,
         buyerUserId,
-        buyerAddress,
+        buyerAddress: effectiveBuyerAddress,
         offerChainId,
         offerCoinId: offerCoin.id,
         offerUnits: coinUnitsToDecimal(offerUnits),
@@ -425,7 +439,7 @@ export function mountOffersRoutes(deps: OffersMountDeps): void {
         idempotencyKey: key,
       });
       await auditLog(buyerUserId, "swap_offer_created", "swap_offer", offer.id,
-        { targetChainId, offerChainId, offerUnits: offerUnits.toString(), requestUnits: requestUnits.toString() });
+        { targetChainId, offerChainId, offerUnits: offerUnits.toString(), requestUnits: requestUnits.toString(), buyerAddress: effectiveBuyerAddress });
 
       sendJson(ctx.res, 201, {
         ...NETWORK_ENVELOPE,

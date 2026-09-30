@@ -339,12 +339,15 @@ export function mountStripeRoutes(deps: MountDeps): void {
     };
     params["metadata[phase_idempotency_key]"] = idemKey;
     if (b.description) params.description = String(b.description).slice(0, 200);
-    params["metadata[phase_user_id]"] = userId;
     if (b.metadata && typeof b.metadata === "object") {
       for (const [k, v] of Object.entries(b.metadata as Record<string, unknown>)) {
+        // Reserved keys are always authoritative from the session, never
+        // from the client.
+        if (k === "phase_user_id" || k === "phase_idempotency_key") continue;
         params[`metadata[${k}]`] = String(v).slice(0, 200);
       }
     }
+    params["metadata[phase_user_id]"] = userId;
     const { status, data } = await stripeApi("POST", "/v1/payment_intents", params, idemKey);
     const d = data as Record<string, unknown>;
     let ledger: FiatLedgerEntry | null = null;

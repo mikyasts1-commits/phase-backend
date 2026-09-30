@@ -19,7 +19,7 @@
  *
  * Mounted from phase-backend.ts: mountAuthRoutes({ route, sendJson, HttpError })
  */
-import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash } from "node:crypto";
 import { getPool } from "./db.js";
 import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
 import { auditLog } from "./sovereign-ledger-core.js";
@@ -139,18 +139,22 @@ class PgAuthStore implements AuthStore {
 
   async createPasswordResetToken(userId: string): Promise<string> {
     const token = randomUUID() + randomUUID();
+    // Store only a SHA-256 hash: a database read must never yield a usable
+    // reset secret.
+    const tokenHash = createHash("sha256").update(token).digest("hex");
     await this.q(
       `INSERT INTO password_reset_tokens(token, user_id) VALUES ($1, $2)`,
-      [token, userId]
+      [tokenHash, userId]
     );
     return token;
   }
 
   async validatePasswordResetToken(token: string): Promise<string | null> {
+    const tokenHash = createHash("sha256").update(token).digest("hex");
     const rows = await this.q<{ userId: string }>(
       `SELECT user_id AS "userId" FROM password_reset_tokens
        WHERE token = $1 AND expires_at > now() AND used_at IS NULL`,
-      [token]
+      [tokenHash]
     );
     return rows[0]?.userId ?? null;
   }
@@ -159,7 +163,8 @@ class PgAuthStore implements AuthStore {
     const userId = await this.validatePasswordResetToken(token);
     if (!userId) return null;
     await this.q(`UPDATE issuance_users SET password_hash = $1 WHERE id = $2`, [newPasswordHash, userId]);
-    await this.q(`UPDATE password_reset_tokens SET used_at = now() WHERE token = $1`, [token]);
+    const tokenHash = createHash("sha256").update(token).digest("hex");
+    await this.q(`UPDATE password_reset_tokens SET used_at = now() WHERE token = $1`, [tokenHash]);
     // Invalidate all sessions for security
     await this.q(`DELETE FROM auth_sessions WHERE user_id = $1`, [userId]);
     return userId;
@@ -658,9 +663,9 @@ export function mountAuthRoutes(deps: AuthMountDeps): void {
       const account = await s.findByEmail(email);
       // Always return success to avoid revealing whether the email exists.
       if (account && account.passwordHash) {
-        const token = await s.createPasswordResetToken(account.id);
-        // TODO: send via email; for now only logged server-side, NEVER returned.
-        console.log(`[auth] password reset token for ${account.id}: ${token} (TODO: email this)`);
+        await s.createPasswordResetToken(account.id);
+        // The token is delivered out-of-band (email). It is never returned
+        // in the response and never logged.
         await auditLog(account.id, "password_reset_requested", "issuance_users", account.id, {});
         sendJson(ctx.res, 200, { ok: true, message: "If an account exists for this email, a reset token was generated." });
       } else {
