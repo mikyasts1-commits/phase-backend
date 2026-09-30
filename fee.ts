@@ -190,17 +190,24 @@ function seedBpsFromEnv(): number {
 
 /** Current fee configuration. Latest version wins; cached briefly.
  *
- * If the database is unreachable (dev/test without DATABASE_URL), falls back
- * to the env-seeded default (TRANSACTION_FEE_BPS, 80) rather than failing —
- * marked version 0 / createdBy 'system:fallback' so callers can tell.
- * Production always has a live DB with the seeded fee_config row.
+ * If the database is unreachable AND no DATABASE_URL is configured (explicit
+ * local dev/test), falls back to the env-seeded default (TRANSACTION_FEE_BPS,
+ * 80) rather than failing — marked version 0 / createdBy 'system:fallback' so
+ * callers can tell.
+ *
+ * Production safety: when DATABASE_URL is set but the database is
+ * unreachable, this THROWS instead of silently using a fallback fee config.
+ * Silently mis-pricing fees in production (wrong bps, missing fee_config
+ * version) is worse than failing the request loudly.
  */
 export async function getFeeConfig(): Promise<FeeConfig> {
   const now = Date.now();
   if (configCache && now - configCache.at < CONFIG_TTL_MS) return configCache.cfg;
   try {
     return await getFeeConfigFromDb(now);
-  } catch {
+  } catch (err) {
+    const hasDbUrl = (process.env.DATABASE_URL ?? "").trim().length > 0;
+    if (hasDbUrl) throw err;
     const cfg: FeeConfig = {
       version: 0,
       feeBps: seedBpsFromEnv(),
