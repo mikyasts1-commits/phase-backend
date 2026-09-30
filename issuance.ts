@@ -13,7 +13,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { auditLog } from "./sovereign-ledger-core.js";
-import { createChain, LedgerError } from "./sovereign-ledger-core.js";
+import { createChain, LedgerError, getChainBalance, PUBLIC_FLOAT_ADDRESS } from "./sovereign-ledger-core.js";
 import { getPool } from "./db.js";
 import { resolveBearerUserId } from "./auth.js";
 import { checkRateLimit } from "./rate-limit.js";
@@ -878,7 +878,42 @@ export function mountIssuanceRoutes(deps: IssuanceMountDeps): void {
       const userId = await requireUserId(ctx);
       const _st2 = await store();
       const coins = await _st2.listCoinsByUser(userId);
-      sendJson(ctx.res, 200, { ...NETWORK_ENVELOPE, userId, coins });
+      // Enrich with live position data the Dashboard needs:
+      //  - availableUnits: the issuer's current on-chain balance of this coin
+      //    (their real, spendable stake — replaces any local guess).
+      //  - realization: how much of the public float has actually been
+      //    purchased, so the app can show a "soft" (listing-price) net worth
+      //    separately from market-backed demand.
+      const enriched = await Promise.all(coins.map(async (c) => {
+        let availableUnits: string | null = null;
+        let publicFloatUnits: string | null = null;
+        let publicFloatSoldUnits: string | null = null;
+        let realizationRatio: number | null = null;
+        try {
+          if (c.issuerAddress) {
+            // getChainBalance returns whole-coin base units on this ledger.
+            availableUnits = BigInt(getChainBalance(c.mintAddress, c.issuerAddress)).toString();
+          }
+        } catch { /* chain unknown on this node — leave null */ }
+        try {
+          const total = c.totalShares != null ? BigInt(Math.round(Number(c.totalShares))) : null;
+          const retained = c.retainedShares != null ? BigInt(Math.round(Number(c.retainedShares))) : null;
+          if (total != null && retained != null && total > 0n) {
+            const initialFloat = total - retained;
+            if (initialFloat > 0n) {
+              const floatUnits = BigInt(getChainBalance(c.mintAddress, PUBLIC_FLOAT_ADDRESS));
+              let sold = initialFloat - floatUnits;
+              if (sold < 0n) sold = 0n;
+              if (sold > initialFloat) sold = initialFloat;
+              publicFloatUnits = initialFloat.toString();
+              publicFloatSoldUnits = sold.toString();
+              realizationRatio = Number(sold) / Number(initialFloat);
+            }
+          }
+        } catch { /* leave null */ }
+        return { ...c, availableUnits, publicFloatUnits, publicFloatSoldUnits, realizationRatio };
+      }));
+      sendJson(ctx.res, 200, { ...NETWORK_ENVELOPE, userId, coins: enriched });
     } catch (err) { fail(ctx, err); }
   });
 

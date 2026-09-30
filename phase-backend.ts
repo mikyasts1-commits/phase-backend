@@ -62,6 +62,7 @@ import { mountIssuanceRoutes } from "./issuance.js";
 import { mountAuthRoutes, resolveBearerUserId } from "./auth.js";
 import { mountSovereignLedgerRoutes } from "./sovereign-ledger.js";
 import { mountMarketplaceRoutes } from "./marketplace.js";
+import { mountOffersRoutes } from "./offers.js";
 import { mountAdminRoutes } from "./admin.js";
 import { mountLegalDocsRoutes } from "./legal-docs.js";
 import { mountSocialRoutes } from "./social-auth.js";
@@ -1111,6 +1112,11 @@ mountSovereignLedgerRoutes({ route, sendJson, HttpError });
 // sovereign chain. Durable settlement attempts with boot reconciliation.
 // Test rails only (topup is a test-mode faucet).
 mountMarketplaceRoutes({ route, sendJson, HttpError });
+
+// --- 8e-vii-b. Swap offers: consent-based coin-for-coin proposals (see offers.ts).
+// Buyer proposes units of their own coin for NET units of a target coin;
+// the seller accepts, counters, or declines from their dashboard.
+mountOffersRoutes({ route, sendJson, HttpError });
 
 // --- 8e-vii-a. Admin API: fee config, treasury, withdrawals, reconciliation
 // (see admin.ts). Admin-only endpoints; bootstrap via PHASE_ADMIN_EMAILS or
