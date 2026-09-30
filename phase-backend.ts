@@ -67,7 +67,7 @@ import { mountAdminRoutes } from "./admin.js";
 import { mountLegalDocsRoutes } from "./legal-docs.js";
 import { mountSocialRoutes } from "./social-auth.js";
 import { mountAnnounceRoutes } from "./social-announce.js";
-import { migrate as migrateFundingDb } from "./db.js";
+import { migrate as migrateFundingDb, migrate as migrateMainSchema } from "./db.js";
 
 // ============================================================================
 // 0. OBJECT STORE — per-key async locking (the object-isolation primitive)
@@ -1036,6 +1036,20 @@ route("GET", "/api/v1/market/status", async (ctx) => {
   sendJson(ctx.res, 200, getFeedStatus());
 });
 
+// --- Main schema migrations (001..017, includes swap_offers). Idempotent
+// (IF NOT EXISTS + schema_migrations), so safe to run on every boot.
+// Best-effort like the funding migrate: if Postgres is unavailable the
+// server still boots and DB-backed routes fail closed at query time.
+if ((process.env.DATABASE_URL ?? "").trim()) {
+  try {
+    await migrateMainSchema();
+    console.log("[db] main schema migrations applied (001..017)");
+  } catch (err) {
+    console.warn(`[db] main schema migrate failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+} else {
+  console.log("[db] DATABASE_URL not set — main schema migrations skipped (local dev without Postgres)");
+}
 // --- 8e-iv. Crypto funding (Circle USDC + USDT on EVM chains, testnet by default — see crypto-funding.ts) ---
 // Best-effort: funding routes need Postgres; if it is unavailable the server
 // still boots and the funding routes fail closed at query time.
