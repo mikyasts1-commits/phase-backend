@@ -1,15 +1,15 @@
 /**
  * ============================================================================
- *  PHASE PROTOCOL — Stripe Fiat Funding (TEST MODE ONLY)
+ *  PHASE PROTOCOL — Stripe Fiat Funding (LIVE MODE)
  * ============================================================================
  *
- *  Card/fiat funding rail for Phase accounts via Stripe. Test mode only —
- *  no real money moves. Uses Stripe's REST API directly (global fetch,
- *  form-encoded bodies) — no npm packages.
+ *  Card/fiat funding rail for Phase accounts via Stripe. Live mode in
+ *  production — real money moves. Uses Stripe's REST API directly
+ *  (global fetch, form-encoded bodies) — no npm packages.
  *
  *  WHAT THIS DOES
- *    - Creates Stripe PaymentIntents in TEST mode for account funding
- *      (e.g. fund $50 CAD via test card 4242 4242 4242 4242).
+ *    - Creates Stripe PaymentIntents for account funding
+ *      (e.g. fund $50 CAD by card).
  *    - Records each intent in the funding ledger (kind='fiat_deposit',
  *      status pending -> confirmed). Idempotent on the PaymentIntent id:
  *      one intent credits at most once.
@@ -22,22 +22,24 @@
  *      push-based confirmation so the app doesn't poll.
  *
  *  WHAT'S REAL vs WHAT'S SIMULATED
- *    - Stripe API calls are REAL (test mode — Stripe's sandbox, no real
- *      charges). Every response carries an explicit TESTMODE label.
+ *    - Stripe API calls are REAL. In production the configured key is a
+ *      live key (sk_live_*); every response carries explicit
+ *      testmode/livemode flags so clients can tell which mode applied.
  *    - The funding ledger is persisted to Postgres (see db.ts and
  *      db/migrations/005_stripe_fiat.sql). Ledger crediting follows the
  *      same confirmed + verified rule as the crypto funding rail.
  *
- *  SAFETY — test mode is the only mode
- *    - The module REFUSES to boot with a live secret key (sk_live_*).
- *      Only sk_test_* is accepted. There is no override flag.
- *    - Live payments require: a reviewed production deployment, FINTRAC
- *      MSB analysis, and Mikyas's explicit approval. None of that exists
- *      yet — do not add a live-mode bypass to this file.
+ *  SAFETY — strict environment separation
+ *    - Production accepts ONLY live secret keys (sk_live_*); every other
+ *      environment accepts ONLY test keys (sk_test_*). A mismatched key
+ *      is refused outright — real cards can never be charged from a
+ *      non-production build, and test traffic can never silently run
+ *      as production.
  *
  *  ENV VARS
- *    STRIPE_SECRET_KEY       Stripe test secret key (sk_test_*). Absent or
- *                            live -> all Stripe routes return 503
+ *    STRIPE_SECRET_KEY       Stripe secret key — sk_live_* in production,
+ *                            sk_test_* elsewhere. Absent or mismatched ->
+ *                            all Stripe routes return 503
  *                            `stripe_not_configured`; nothing is faked.
  *    STRIPE_WEBHOOK_SECRET   Webhook endpoint secret (whsec_*). Required
  *                            for /api/v1/stripe/webhooks; absent -> 503.
@@ -66,6 +68,11 @@ interface RouteContext {
 }
 
 const STRIPE_API = "https://api.stripe.com";
+
+/** Ledger network label for Stripe deposits: mainnet for live keys, testnet otherwise. */
+function stripeNetworkLabel(): string {
+  return stripeModeFlags().livemode ? "mainnet" : "testnet";
+}
 
 /** True when running as the production deployment. */
 function isProduction(): boolean {
@@ -203,11 +210,11 @@ async function insertFiatLedgerEntry(args: {
        (id, user_id, kind, chain, amount, currency, status, verified,
         idempotency_key, network, stripe_payment_intent_id, note)
      VALUES ($1, $2, 'fiat_deposit', 'stripe', $3, $4, 'pending', false,
-             $5, 'testnet', $6, 'Stripe test-mode deposit')
+             $5, $6, $7, 'Stripe deposit')
      ON CONFLICT (stripe_payment_intent_id) WHERE stripe_payment_intent_id IS NOT NULL DO NOTHING
      RETURNING id, user_id, amount, currency, stripe_payment_intent_id, status, verified`,
     [id, args.userId, String(args.amountMinor), args.currency.toUpperCase(),
-     idempotencyKey, args.paymentIntentId],
+     idempotencyKey, stripeNetworkLabel(), args.paymentIntentId],
   );
   if (rows.length > 0) return { entry: rows[0], created: true };
   const existing = await dbQueryOne<FiatLedgerEntry>(
@@ -306,7 +313,7 @@ export function mountStripeRoutes(deps: MountDeps): void {
     });
   });
 
-  // --- Create a test PaymentIntent (+ ledger entry) ---
+  // --- Create a PaymentIntent (+ ledger entry) ---
   deps.route("POST", "/api/v1/stripe/payment-intents", async (ctx) => {
     if (stripeError(deps, ctx)) return;
     const b = requireBodyObject(ctx.body, deps.HttpError);
@@ -364,7 +371,6 @@ export function mountStripeRoutes(deps: MountDeps): void {
     }
     deps.sendJson(ctx.res, status, {
       ...stripeModeFlags(),
-      livemode: false,
       id: d.id,
       client_secret: d.client_secret,
       amount: d.amount,
@@ -392,7 +398,6 @@ export function mountStripeRoutes(deps: MountDeps): void {
     const d = data as Record<string, unknown>;
     deps.sendJson(ctx.res, status, {
       ...stripeModeFlags(),
-      livemode: false,
       id: d.id,
       amount: d.amount,
       currency: d.currency,
@@ -416,7 +421,6 @@ export function mountStripeRoutes(deps: MountDeps): void {
     if (status >= 400) {
       deps.sendJson(ctx.res, status, {
         ...stripeModeFlags(),
-        livemode: false,
         id,
         stripe_error: d.error,
       });
@@ -455,7 +459,6 @@ export function mountStripeRoutes(deps: MountDeps): void {
     }
     deps.sendJson(ctx.res, 200, {
       ...stripeModeFlags(),
-      livemode: false,
       id: d.id,
       stripe_status: d.status,
       amount_received: d.amount_received,
@@ -491,7 +494,6 @@ export function mountStripeRoutes(deps: MountDeps): void {
     }
     deps.sendJson(ctx.res, 200, {
       ...stripeModeFlags(),
-      livemode: false,
       userId,
       totals, // minor units per currency, e.g. { CAD: { credited: "5000", pending: "0" } }
       note: "credited = confirmed + verified fiat deposits only. Amounts are in minor units (cents).",

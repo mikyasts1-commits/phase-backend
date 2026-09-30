@@ -1228,11 +1228,17 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
       const out = [];
       for (const c of coins) {
         let category: string | null = null;
+        let tagline: string | null = null;
+        let valueThesis: string | null = null;
         let socialProfiles: Array<{ platform: string; url: string }> = [];
         try {
           const draft = c.draftId ? await issuance.getDraft(c.draftId) : null;
           const raw = draft?.category?.trim();
           category = raw ? raw : null;
+          const rawTag = draft?.tagline?.trim();
+          tagline = rawTag ? rawTag : null;
+          const rawThesis = draft?.valueThesis?.trim();
+          valueThesis = rawThesis ? rawThesis : null;
           if (draft?.socialProfiles) {
             socialProfiles = Array.isArray(draft.socialProfiles)
               ? draft.socialProfiles
@@ -1251,6 +1257,8 @@ export function mountMarketplaceRoutes(deps: MarketplaceMountDeps): void {
           priceUsd: Number(c.priceUsd),
           supply: c.supply,
           category,
+          tagline,
+          valueThesis,
           isMeme: c.isMeme,
           hasAgreement: c.signatureId != null,
           issuerUserId: c.userId,
